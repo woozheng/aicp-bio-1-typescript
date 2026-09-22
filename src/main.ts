@@ -10,6 +10,7 @@
  * 6. 启动 gateway
  * 7. 启动 file_receiver
  * 8. 启动 websocket
+ * 9. 启动可视化 worker（如果开启）
  */
 
 import { SystemServer } from "./runtime/system.js";
@@ -106,6 +107,14 @@ async function main() {
     throw new Error(`WebSocket 启动失败: ${wsResult?.payload?.error ?? "未知错误"}`);
   }
   console.log("[AICP-TS] WebSocket started:", wsResult.payload);
+
+  // 9. 启动可视化 worker（如果开启）
+  if ((system as any)._vizEnabled) {
+    await system.startVisualizer();
+    console.log(`[AICP-TS] Visualizer enabled on channel ${(system as any)._vizChannel}`);
+  } else {
+    console.log("[AICP-TS] Visualizer disabled");
+  }
 
   console.log("[AICP-TS] All services started.");
 }
