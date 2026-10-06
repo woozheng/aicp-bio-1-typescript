@@ -7,11 +7,22 @@
  * 3. 本地回调确认：meta.is_callback 存在 → 立即 ACK + 后台投递
  *
  * 注意：远程通信（跨机器）不在 route 里，由 builtins/tools/remote_agent 处理。
+ *
+ * 协议级：
+ *   - 每次路由尝试消耗一个 ttl
+ *   - 结构性失败设置 envelop.status；同时写 payload["error"]（向后兼容）
  */
 
 import { Envelop } from "./Envelop.js";
 import type { Agent } from "./Agent.js";
 import { plugins } from "./plugins.js";
+import {
+  STATUS_INVALID,
+  STATUS_MISSING,
+  STATUS_TIMEOUT,
+  STATUS_EXCEPTION,
+  STATUS_DORMANT,
+} from "./status.js";
 
 // ============================================================
 // 异步内部标记（不对外暴露）
@@ -36,20 +47,31 @@ export async function route(
   agent: Agent | null = null,
   timeout: number = 1200
 ): Promise<Envelop | null> {
+  // ---- INVALID：Envelop 结构违反约束 ----
   if (!envelop.receiver) {
-    envelop.payload = { error: "Missing receiver" };
+    envelop.status = STATUS_INVALID;
+    envelop.payload = { ...envelop.payload, error: "Missing receiver" };
     return envelop;
   }
 
+  // ---- DORMANT：ttl 耗尽，终态 ----
   if (envelop.ttl <= 0) {
-    envelop.payload = { error: "TTL expired" };
+    envelop.status = STATUS_DORMANT;
+    envelop.payload = { ...envelop.payload, error: "TTL expired" };
     return envelop;
   }
+
+  // ---- 每次路由尝试消耗一个 ttl（协议级） ----
   envelop.ttl -= 1;
 
+  // ---- 插件查找（协议级） ----
   const plugin = plugins.get(envelop.receiver);
   if (!plugin) {
-    envelop.payload = { error: `Plugin not found: ${envelop.receiver}` };
+    envelop.status = STATUS_MISSING;
+    envelop.payload = {
+      ...envelop.payload,
+      error: `Plugin not found: ${envelop.receiver}`,
+    };
     return envelop;
   }
 
@@ -99,7 +121,11 @@ export async function route(
     ]);
     return result;
   } catch (e: any) {
-    envelop.payload = { error: `${e?.message ?? String(e)}`.slice(0, 200) };
+    envelop.status = STATUS_EXCEPTION;
+    envelop.payload = {
+      ...envelop.payload,
+      error: `${e?.message ?? String(e)}`.slice(0, 200),
+    };
     return envelop;
   }
 }
@@ -133,17 +159,24 @@ async function executeAsync(
     } else {
       result = new Envelop({
         payload: { error: `Plugin not found: ${envelop.receiver}` },
+        status: STATUS_MISSING,
       });
     }
   } catch (e: any) {
     result = new Envelop({
       payload: { error: `${e?.message ?? String(e)}`.slice(0, 200) },
+      status: STATUS_EXCEPTION,
     });
   }
 
   if (!result) {
-    result = new Envelop({ payload: { error: "Plugin returned None" } });
+    result = new Envelop({
+      payload: { error: "Plugin returned None" },
+      status: STATUS_EXCEPTION,
+    });
   }
+  // 若插件返回了 status=""（成功），保持它。
+  // 若插件显式设了 META_FAILED，也保持。
 
   // 构造回调 Envelop
   result.sender = envelop.receiver;

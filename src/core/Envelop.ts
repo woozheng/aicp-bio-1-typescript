@@ -1,6 +1,10 @@
 /**
  * Envelop — 唯一数据载体
  * 与 Python 版 core.py 的 Envelop 完全对应
+ *
+ * 协议字段（Tier 1）：sender, receiver, ttl, status, meta
+ * 额外字段（本实现选择，Tier 3；旧代码依赖，保留）：
+ *   intent, channel_id, trace_id, message_id, created_at, path_history
  */
 
 export interface EnvelopData {
@@ -15,6 +19,7 @@ export interface EnvelopData {
   meta: Record<string, any>;
   created_at: string;
   path_history: string[];
+  status: string; // 新增：协议级失败状态
 }
 
 export class Envelop {
@@ -29,6 +34,7 @@ export class Envelop {
   meta: Record<string, any>;
   created_at: string;
   path_history: string[];
+  status: string; // 新增：协议级失败状态；空 = 无错误
 
   constructor(params: {
     sender?: string;
@@ -38,6 +44,7 @@ export class Envelop {
     channel_id?: string;
     ttl?: number;
     meta?: Record<string, any>;
+    status?: string; // 新增
   } = {}) {
     this.sender = params.sender ?? "";
     this.receiver = params.receiver ?? "";
@@ -50,6 +57,7 @@ export class Envelop {
     this.meta = params.meta ?? {};
     this.created_at = new Date().toISOString();
     this.path_history = [];
+    this.status = params.status ?? ""; // 新增
   }
 
   to_dict(): Record<string, any> {
@@ -64,6 +72,7 @@ export class Envelop {
       ttl: this.ttl,
       meta: this.meta,
       created_at: this.created_at,
+      status: this.status, // 新增
     };
   }
 
@@ -76,6 +85,7 @@ export class Envelop {
       channel_id: data.channel_id ?? "",
       ttl: data.ttl ?? 10,
       meta: data.meta ?? {},
+      status: data.status ?? "", // 新增
     });
     env.trace_id = data.trace_id ?? env.trace_id;
     env.message_id = data.message_id ?? env.message_id;
