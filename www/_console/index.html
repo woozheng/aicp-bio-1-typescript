@@ -202,6 +202,109 @@
     background: rgba(245, 158, 11, 0.15);
     border-color: rgba(245, 158, 11, 0.3);
 }
+
+/* 侧边 Tab */
+.chat-side .side-tabs{display:flex;gap:4px;background:rgba(255,255,255,0.04);border-radius:6px;padding:2px}
+.chat-side .side-tab{background:transparent;border:none;color:#888;font-size:11px;padding:4px 10px;border-radius:4px;cursor:pointer;font-family:inherit;transition:0.15s}
+.chat-side .side-tab:hover{color:#e0e0e0}
+.chat-side .side-tab.active{background:rgba(233,69,96,0.2);color:#e94560;font-weight:600}
+.chat-side .side-panel{display:none;flex:1;flex-direction:column;overflow:hidden;min-height:0}
+.chat-side .side-panel.active{display:flex}
+
+/* Flow 面板 */
+.flow-body{
+    font-family:monospace;
+    font-size:11px;
+    line-height:1.6;
+    color:#cbd5e1;
+    padding:8px 8px 12px;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+}
+.flow-body .flow-empty{color:#555;text-align:center;padding:20px 0;font-size:11px}
+
+.flow-item{
+    border-left:2px solid rgba(255,255,255,0.08);
+    background:rgba(255,255,255,0.02);
+    border-radius:0 6px 6px 0;
+    padding:5px 8px 5px 9px;
+    animation:flowIn 0.25s ease;
+}
+@keyframes flowIn{
+    from{opacity:0;transform:translateY(3px)}
+    to{opacity:1;transform:translateY(0)}
+}
+.flow-item .flow-head{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-size:10px;
+    color:#888;
+}
+.flow-item .flow-time{color:#555;flex-shrink:0}
+.flow-item .flow-tag{
+    font-size:9px;
+    padding:1px 6px;
+    border-radius:8px;
+    font-weight:600;
+    letter-spacing:0.3px;
+    flex-shrink:0;
+}
+.flow-item .flow-text{
+    margin-top:3px;
+    white-space:pre-wrap;
+    word-break:break-word;
+    font-size:11px;
+    color:#cbd5e1;
+}
+.flow-item .flow-mono{
+    margin-top:3px;
+    white-space:pre-wrap;
+    word-break:break-all;
+    font-size:10px;
+    color:#7c8798;
+    background:rgba(0,0,0,0.25);
+    border-radius:4px;
+    padding:4px 6px;
+    max-height:180px;
+    overflow-y:auto;
+}
+
+.flow-item.user{border-left-color:#4a90d9;background:rgba(74,144,217,0.06)}
+.flow-item.user .flow-tag{background:rgba(74,144,217,0.18);color:#7db8e8}
+
+.flow-item.think{border-left-color:#64748b;background:rgba(100,116,139,0.06)}
+.flow-item.think .flow-tag{background:rgba(100,116,139,0.2);color:#94a3b8}
+.flow-item.think .flow-text{color:#94a3b8;font-style:italic}
+
+.flow-item.reply{border-left-color:#10b981;background:rgba(16,185,129,0.06)}
+.flow-item.reply .flow-tag{background:rgba(16,185,129,0.18);color:#34d399}
+
+.flow-item.call{border-left-color:#e94560;background:rgba(233,69,96,0.06)}
+.flow-item.call .flow-tag{background:rgba(233,69,96,0.2);color:#e94560}
+
+.flow-item.system{border-left-color:#f59e0b;background:rgba(245,158,11,0.05)}
+.flow-item.system .flow-tag{background:rgba(245,158,11,0.18);color:#f59e0b}
+
+.flow-item.ok{border-left-color:#10b981;background:rgba(16,185,129,0.05)}
+.flow-item.ok .flow-tag{background:rgba(16,185,129,0.18);color:#34d399}
+
+.flow-item.err{border-left-color:#ef4444;background:rgba(239,68,68,0.06)}
+.flow-item.err .flow-tag{background:rgba(239,68,68,0.2);color:#ef4444}
+
+.flow-item details{margin-top:3px}
+.flow-item details summary{
+    cursor:pointer;
+    color:#666;
+    font-size:9px;
+    user-select:none;
+    outline:none;
+    list-style:none;
+}
+.flow-item details summary::-webkit-details-marker{display:none}
+.flow-item details summary::before{content:"▸ "}
+.flow-item details[open] summary::before{content:"▾ "}
     </style>
 </head>
 <body>
@@ -264,11 +367,23 @@
 
                 <div class="chat-side" id="chatSide">
                     <div class="side-header">
-                        <span>📅 历史记录</span>
-                        <button onclick="loadServerHistory()">🔄</button>
+                        <div class="side-tabs">
+                            <button class="side-tab active" data-tab="history" onclick="switchSideTab('history')">📅 历史</button>
+                            <button class="side-tab" data-tab="flow" onclick="switchSideTab('flow')">🌊 Flow</button>
+                        </div>
+                        <button onclick="refreshSideTab()">🔄</button>
                     </div>
-                    <div class="side-body" id="historyList">
-                        <div class="empty-state" style="padding:20px 0">加载中...</div>
+                
+                    <div class="side-panel active" id="side-history">
+                        <div class="side-body" id="historyList">
+                            <div class="empty-state" style="padding:20px 0">加载中...</div>
+                        </div>
+                    </div>
+                
+                    <div class="side-panel" id="side-flow">
+                        <div class="side-body flow-body" id="flowView">
+                            <div class="flow-empty">等待 flow...</div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1046,7 +1161,11 @@ function connectWS() {
                 if (msg.type === 'pong') return;
                 var data = msg.data || msg;
                 var type = data.type || msg.type;
-
+// ★ 收到任何后端事件，只要当前在 Flow 标签，就增量刷新
+if (currentSideTab === 'flow') {
+    clearTimeout(window._flowRefreshTimer);
+    window._flowRefreshTimer = setTimeout(loadFlow, 300);
+}
                 var content = '';
                 var extraClass = '';
 
@@ -1359,7 +1478,273 @@ function backToCurrent() {
     document.getElementById('chatSide').classList.remove('open');
     document.getElementById('sideOverlay').classList.remove('show');
 }
+// ============================================================
+// 6.5 侧边栏 Tab 切换 + Flow 视图
+// ============================================================
+var currentSideTab = 'history';
 
+function switchSideTab(tab) {
+    currentSideTab = tab;
+
+    document.querySelectorAll('.side-tab').forEach(function(el) {
+        el.classList.remove('active');
+    });
+    var tabBtn = document.querySelector('.side-tab[data-tab="' + tab + '"]');
+    if (tabBtn) tabBtn.classList.add('active');
+
+    document.querySelectorAll('.side-panel').forEach(function(el) {
+        el.classList.remove('active');
+    });
+    var panel = document.getElementById('side-' + tab);
+    if (panel) panel.classList.add('active');
+
+    if (tab === 'history') {
+        loadServerHistory();
+    } else if (tab === 'flow') {
+        loadFlow();
+    }
+}
+
+function refreshSideTab() {
+    if (currentSideTab === 'history') {
+        loadServerHistory();
+    } else {
+        resetFlow();
+        loadFlow();
+    }
+}
+
+// ============================================================
+// Flow 视图 — 增量追加
+// ============================================================
+var flowSeen = {};
+var flowCount = 0;
+var flowInitialized = false;
+
+function _flowKey(entry) {
+    var ts = entry.timestamp || '';
+    var from = entry.from || '';
+    var call = entry.call || entry.action || '';
+    var sub = entry.content || entry.result || entry.think || '';
+    if (sub && sub.length > 60) sub = sub.slice(0, 60);
+    return ts + '|' + from + '|' + call + '|' + sub;
+}
+
+function _flowEsc(text) {
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function _renderFlowItem(entry) {
+    var tsFull = entry.timestamp || '';
+    var ts = tsFull ? tsFull.slice(11, 19) : '';
+    var from = entry.from || '';
+    var html = '';
+
+    if (from === 'user') {
+        var content = entry.content || '';
+        if (!content) return '';
+        html += '<div class="flow-item user">';
+        html += '  <div class="flow-head"><span class="flow-time">' + ts + '</span>';
+        html += '    <span class="flow-tag">👤 USER</span></div>';
+        html += '  <div class="flow-text">' + _flowEsc(content) + '</div>';
+        html += '</div>';
+        return html;
+    }
+
+    if (from === 'ai') {
+        var think = entry.think || '';
+        var content = entry.content || '';
+        var call = entry.call || '';
+        var args = entry.args || {};
+
+        if (think) {
+            html += '<div class="flow-item think">';
+            html += '  <div class="flow-head"><span class="flow-time">' + ts + '</span>';
+            html += '    <span class="flow-tag">💭 THINK</span></div>';
+            html += '  <div class="flow-text">' + _flowEsc(think) + '</div>';
+            html += '</div>';
+        }
+
+        if (content && (call === 'reply' || call === 'ask_user')) {
+            html += '<div class="flow-item reply">';
+            html += '  <div class="flow-head"><span class="flow-time">' + ts + '</span>';
+            html += '    <span class="flow-tag">🤖 ' + (call === 'ask_user' ? 'ASK' : 'REPLY') + '</span></div>';
+            html += '  <div class="flow-text">' + _flowEsc(content) + '</div>';
+            html += '</div>';
+        }
+
+        if (call && call !== 'reply' && call !== 'ask_user') {
+            var argsStr = JSON.stringify(args, null, 2);
+            html += '<div class="flow-item call">';
+            html += '  <div class="flow-head"><span class="flow-time">' + ts + '</span>';
+            html += '    <span class="flow-tag">🔧 CALL</span>';
+            html += '    <span style="color:#e94560;font-weight:600">' + _flowEsc(call) + '</span></div>';
+            html += '  <div class="flow-mono">' + _flowEsc(argsStr) + '</div>';
+            html += '</div>';
+        }
+
+        return html;
+    }
+
+    if (from === 'system') {
+        var action = entry.action || '';
+        var result = entry.result || '';
+        var detail = entry.detail || {};
+
+        var head = '';
+        var cls = 'system';
+        var body = '';
+
+        if (action === 'call_start') {
+            cls = 'system';
+            head = '📤 派发 ' + _flowEsc(detail.target || '');
+            if (detail.call_id) head += ' <span style="color:#666">[' + _flowEsc(String(detail.call_id).slice(0, 8)) + ']</span>';
+            if (detail.status === 'processing') head += ' ⏳';
+            body = JSON.stringify(detail.params || {}, null, 2);
+        } else if (action === 'call_end') {
+            cls = 'ok';
+            head = '✅ 完成';
+            if (detail.call_id) head += ' <span style="color:#666">[' + _flowEsc(String(detail.call_id).slice(0, 8)) + ']</span>';
+            body = JSON.stringify(detail.result || {}, null, 2);
+        } else if (action === 'call_error') {
+            cls = 'err';
+            head = '❌ 调用失败';
+            if (detail.call_id) head += ' <span style="color:#666">[' + _flowEsc(String(detail.call_id).slice(0, 8)) + ']</span>';
+            body = detail.error || '';
+        } else if (action === 'async_processing') {
+            cls = 'system';
+            head = '⏳ 已提交 <span style="color:#666">[trace=' + _flowEsc(String(detail.trace_id || '').slice(0, 8)) + ']</span>';
+        } else if (action === 'async_callback') {
+            cls = 'ok';
+            head = '📨 回调 ' + (detail.matched ? '✅' : '⚠️');
+            if (detail.call_id) head += ' <span style="color:#666">[' + _flowEsc(String(detail.call_id).slice(0, 8)) + ']</span>';
+            body = JSON.stringify(detail.result || {}, null, 2);
+        } else if (action === 'task_summary') {
+            cls = 'system';
+            head = '📋 ' + _flowEsc(result);
+        } else if (action === 'validation_error') {
+            cls = 'err';
+            var fullResult = (entry.extra || {}).full_result || result;
+            head = '❌ 校验失败';
+            body = fullResult;
+        } else {
+            cls = 'system';
+            head = '⚙️ ' + _flowEsc(action || 'system');
+            if (result) body = result;
+            else if ((entry.extra || {}).full_result) body = entry.extra.full_result;
+        }
+
+        html += '<div class="flow-item ' + cls + '">';
+        html += '  <div class="flow-head"><span class="flow-time">' + ts + '</span>';
+        html += '    <span class="flow-tag">' + (cls === 'ok' ? 'OK' : (cls === 'err' ? 'ERR' : 'SYS')) + '</span>';
+        html += '    <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + head + '</span></div>';
+
+        if (body) {
+            var bodyStr = String(body);
+            if (bodyStr.length > 200) {
+                html += '  <details><summary>展开 (' + bodyStr.length + ' 字)</summary>';
+                html += '  <div class="flow-mono">' + _flowEsc(bodyStr) + '</div></details>';
+            } else {
+                html += '  <div class="flow-mono">' + _flowEsc(bodyStr) + '</div>';
+            }
+        }
+        html += '</div>';
+        return html;
+    }
+
+    return '';
+}
+
+function appendFlowEntries(entries) {
+    var box = document.getElementById('flowView');
+
+    if (!flowInitialized) {
+        box.innerHTML = '';
+        flowInitialized = true;
+    }
+
+    if (!entries || entries.length === 0) {
+        if (flowCount === 0) {
+            box.innerHTML = '<div class="flow-empty">暂无信息流</div>';
+        }
+        return;
+    }
+
+    var stickBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 40;
+
+    var frag = document.createDocumentFragment();
+    var added = 0;
+
+    for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i];
+        var key = _flowKey(entry);
+        if (flowSeen[key]) continue;
+        flowSeen[key] = true;
+
+        var itemHtml = _renderFlowItem(entry);
+        if (!itemHtml) continue;
+
+        var wrap = document.createElement('div');
+        wrap.innerHTML = itemHtml;
+        var node = wrap.firstChild;
+        if (node) {
+            frag.appendChild(node);
+            added++;
+        }
+    }
+
+    if (added > 0) {
+        var emptyEl = box.querySelector('.flow-empty');
+        if (emptyEl) emptyEl.remove();
+        box.appendChild(frag);
+        flowCount += added;
+    }
+
+    if (stickBottom) {
+        box.scrollTop = box.scrollHeight;
+    }
+}
+
+async function loadFlow() {
+    var box = document.getElementById('flowView');
+
+    if (!flowInitialized && flowCount === 0) {
+        box.innerHTML = '<div class="flow-empty">加载中...</div>';
+    }
+
+    try {
+        var res = await fetch('/api/builtins/agents/main_agent', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action: 'get_session',
+                session_id: sessionId
+            })
+        });
+        var data = await res.json();
+        if (data.ok && data.flow) {
+            appendFlowEntries(data.flow);
+        } else if (!flowInitialized) {
+            box.innerHTML = '<div class="flow-empty">加载失败: ' + (data.error || '未知') + '</div>';
+        }
+    } catch(e) {
+        if (!flowInitialized) {
+            box.innerHTML = '<div class="flow-empty">加载失败: ' + e.message + '</div>';
+        }
+    }
+}
+
+function resetFlow() {
+    flowSeen = {};
+    flowCount = 0;
+    flowInitialized = false;
+    var box = document.getElementById('flowView');
+    if (box) box.innerHTML = '<div class="flow-empty">等待 flow...</div>';
+}
 // ============================================================
 // 7. 历史记录
 // ============================================================
