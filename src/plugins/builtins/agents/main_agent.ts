@@ -1228,9 +1228,34 @@ think 字段约束：
 
 7. 一次性任务 → aicp_chat 兜底
 
+
+   ⚠️ aicp_chat 的返回格式：
+   - 成功：{"ok": true, "data": "...", "artifact": "logs/code_cleaned_xxx.js"}
+   - 失败：{"ok": false, "error": "...", "error_category": "...", "artifact": "logs/llm_errors/error_xxx.txt", "aborted": false}
+
+   ⚠️ artifact 是什么：
+   - 一个文件路径，相对项目根
+   - 成功时指向最后执行成功的代码文件
+   - 失败时指向最后一次的错误报告
+   - 路径可直接传给 os/file_utils_api 的 read_file
+   - 当aicp_chat返回结果和task预期不一致，可以读取artifact，分析后再给出更准确的task描述，保证task准确。
+
+   ⚠️ 失败时怎么办：
+   - 先看 error 字段，它包含错误分类、原因、处理建议
+   - error_category 含义：
+     * LLM_CODE      → 代码写错了，改 task 重试
+     * SANDBOX_BLOCK → 用了沙箱禁止的操作，换实现方式
+     * RUNTIME_INTERNAL → runtime 内部问题，不要改代码，直接告知用户
+   - aborted=true 表示系统已终止重试，不要再调 aicp_chat
+   - 需要看完整错误报告或上一轮代码时，读 artifact：
+     {"think":"aicp_chat失败，读错误报告","call":"use_tool","retain":3,
+      "args":{"target":"os/file_utils_api","action":"read_file","params":{"path":"logs/llm_errors/error_xxx.txt"}}}
+   - 读完调整 task，重新调 aicp_chat
+   - 连续 2 次相同错误，直接回复用户"无法完成"
+
 ⚠️ 不要在不确定 action 的情况下反复试错。
    比如「读目录」用 read_file 失败，说明 action 不对，应该先查契约。
-   
+
 【信息流格式】
 系统会把历史对话按以下格式给你：
 
@@ -1287,11 +1312,11 @@ think 字段约束：
     - 工具有明确顺序（有依赖关系）
     - 任务顺利完成，没走弯路
     - 未来可能遇到类似任务
-    
+
     沉淀方式：write_file 写一个 SKILL.md 到 data/skills/aicp/{skill_id}/SKILL.md。
     格式：frontmatter（title/description/tags）+ 正文（适用场景/工作流程）。
     参数用 {xxx} 占位。
-    
+
     ⚠️ 不是每个任务都要沉淀。只在"明显值得复用"时才写。
     ⚠️ 写完不用手动 scan。下次调 skill_loader.search 或 list 会自动扫到。
 
@@ -1324,7 +1349,7 @@ class PromptManager {
 
     if (context) parts.push(`【信息流】\n${context}`);
 
-    
+
 
     if (experience) parts.push(`【经验背包】\n${experience}`);
     if (taskboard) parts.push(`【任务看板】\n${taskboard}`);
@@ -1420,7 +1445,7 @@ class LLMThinker {
         raw += token;
         tokenCount++;
 
-        
+
         if (raw.length > MAX_RAW_LENGTH) {
     Logger.warn(`LLM 输出过长（${raw.length}），中断`);
     interrupted = true;

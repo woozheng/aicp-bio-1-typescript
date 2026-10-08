@@ -19,11 +19,16 @@
  *   - content 走 @@CONTENT@@ 块
  *   - edit_file 用 find / replace（短文本，不走块）
  *   - read_file_lines 用 start_line / end_line（行号从 1 开始）
+ *
+ * 路径策略：
+ *   - 所有相对路径锚定到 PROJECT_ROOT（项目根）
+ *   - 绝对路径原样使用（但过黑名单）
+ *   - 禁止访问系统目录
  */
 
 import { readFile, writeFile, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve, isAbsolute, normalize, relative } from "node:path";
 import type { Envelop } from "../../core/Envelop.js";
 import type { Agent } from "../../core/Agent.js";
 
@@ -32,6 +37,90 @@ import type { Agent } from "../../core/Agent.js";
 // ============================================================
 
 const MAX_INLINE_SIZE = 100 * 1024; // 100KB
+
+// ★ 项目根：以服务启动时的 CWD 为准
+// 如果你的服务不是从项目根启动，改成：
+//   const PROJECT_ROOT = resolve(__dirname, "..", "..", "..", "..");
+const PROJECT_ROOT = process.cwd();
+
+// ★ 系统目录黑名单（绝对路径前缀，不区分大小写）
+const FORBIDDEN_PREFIXES = [
+  // Windows
+  "c:/windows/",
+  "c:/program files/",
+  "c:/program files (x86)/",
+  "c:/system32/",
+  "c:/syswow64/",
+  "c:/boot/",
+  "c:/efi/",
+  "c:/perflogs/",
+  "c:/programdata/",
+  "c:/recovery/",
+  "c:/system volume information/",
+  // Linux
+  "/etc/",
+  "/proc/",
+  "/sys/",
+  "/boot/",
+  "/dev/",
+  "/root/",
+  "/usr/",
+  "/bin/",
+  "/sbin/",
+  "/lib/",
+  "/lib64/",
+  "/opt/",
+  "/var/",
+  "/tmp/",
+  "/run/",
+  "/mnt/",
+  "/media/",
+  "/srv/",
+  "/lost+found/",
+];
+
+/**
+ * 解析路径：
+ * - 绝对路径 → 过黑名单后原样返回
+ * - 相对路径 → 锚定到 PROJECT_ROOT
+ * - 黑名单命中 → 抛错
+ */
+function resolvePath(inputPath: string): string {
+  if (typeof inputPath !== "string" || !inputPath) {
+    throw new Error("path 必须是非空字符串");
+  }
+
+  // 统一正斜杠，便于黑名单比较
+  const normalized = inputPath.replace(/\\/g, "/");
+
+  // 黑名单检查（只看前缀）
+  const lower = normalized.toLowerCase();
+  for (const forbidden of FORBIDDEN_PREFIXES) {
+    if (lower.startsWith(forbidden)) {
+      throw new Error(`禁止访问系统目录: ${inputPath}`);
+    }
+  }
+
+  // 绝对路径 → 原样
+  if (isAbsolute(normalized)) {
+    return normalize(normalized);
+  }
+
+  // 相对路径 → 锚定项目根
+  return resolve(PROJECT_ROOT, normalized);
+}
+
+/**
+ * 把绝对路径转回相对项目根的展示路径（用于返回给 LLM）
+ */
+function displayPath(absPath: string): string {
+  try {
+    const rel = relative(PROJECT_ROOT, absPath);
+    return rel.replace(/\\/g, "/") || ".";
+  } catch {
+    return absPath;
+  }
+}
 
 // ============================================================
 // applyPatch — 应用 unified diff 补丁
@@ -80,12 +169,6 @@ function parsePatch(patch: string): Hunk[] {
   return hunks;
 }
 
-/**
- * 删除 hunk 末尾的 "context + 空行"
- *
- * patch 末尾的 "\n" 会被 split 成空字符串，被当成 context 行，
- * 导致 oldText 多一个 "\n"，indexOf 匹配不到。
- */
 function pushHunk(hunks: Hunk[], hunk: Hunk): void {
   while (
     hunk.lines.length > 0 &&
@@ -173,25 +256,26 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 
   try {
     // ============================================================
-    // read_file（>100KB 只返回尾部预览）
+    // read_file
     // ============================================================
     if (action === "read_file") {
-      const path = params.path;
-      if (!path) return err(envelop, "缺少 path 参数");
-      if (!existsSync(path)) return err(envelop, `文件不存在: ${path}`);
+      const rawPath = params.path;
+      if (!rawPath) return err(envelop, "缺少 path 参数");
+
+      const path = resolvePath(rawPath);
+      if (!existsSync(path)) return err(envelop, `文件不存在: ${rawPath}`);
 
       const fileStat = await stat(path);
-      if (!fileStat.isFile()) return err(envelop, `路径不是文件: ${path}`);
+      if (!fileStat.isFile()) return err(envelop, `路径不是文件: ${rawPath}`);
 
       const fileSize = fileStat.size;
 
-      // ≤100KB：正常读取全文
       if (fileSize <= MAX_INLINE_SIZE) {
         const content = await readFile(path, "utf-8");
         envelop.payload = {
           ok: true,
           data: {
-            path,
+            path: displayPath(path),
             content,
             size: fileSize,
             size_kb: Math.round((fileSize / 1024) * 10) / 10,
@@ -201,7 +285,6 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
         return envelop;
       }
 
-      // >100KB：读取尾部 100KB
       const content = await readFile(path, "utf-8");
       const totalLines = content.split("\n").length;
       const tail = content.slice(-MAX_INLINE_SIZE);
@@ -212,7 +295,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       envelop.payload = {
         ok: true,
         data: {
-          path,
+          path: displayPath(path),
           preview: tail,
           size: fileSize,
           size_kb: Math.round((fileSize / 1024) * 10) / 10,
@@ -229,15 +312,17 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     }
 
     // ============================================================
-    // read_file_lines（按行读，大文件用）
+    // read_file_lines
     // ============================================================
     if (action === "read_file_lines") {
-      const path = params.path;
-      if (!path) return err(envelop, "缺少 path 参数");
-      if (!existsSync(path)) return err(envelop, `文件不存在: ${path}`);
+      const rawPath = params.path;
+      if (!rawPath) return err(envelop, "缺少 path 参数");
+
+      const path = resolvePath(rawPath);
+      if (!existsSync(path)) return err(envelop, `文件不存在: ${rawPath}`);
 
       const fileStat = await stat(path);
-      if (!fileStat.isFile()) return err(envelop, `路径不是文件: ${path}`);
+      if (!fileStat.isFile()) return err(envelop, `路径不是文件: ${rawPath}`);
 
       const content = await readFile(path, "utf-8");
       const lines = content.split("\n");
@@ -263,6 +348,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
         envelop.payload = {
           ok: true,
           data: {
+            path: displayPath(path),
             lines: result,
             total_lines: totalLines,
             start,
@@ -277,6 +363,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       envelop.payload = {
         ok: true,
         data: {
+          path: displayPath(path),
           lines: selected,
           total_lines: totalLines,
           start,
@@ -289,21 +376,22 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     }
 
     // ============================================================
-    // write_file（允许空内容）
+    // write_file
     // ============================================================
     if (action === "write_file") {
-      const path = params.path;
+      const rawPath = params.path;
       const content = params.content ?? "";
-      if (!path) return err(envelop, "缺少 path 参数");
+      if (!rawPath) return err(envelop, "缺少 path 参数");
       if (typeof content !== "string") return err(envelop, "content 必须是字符串");
 
+      const path = resolvePath(rawPath);
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, content, "utf-8");
 
       const f = Bun.file(path);
       if (!(await f.exists())) return err(envelop, "写入失败: 文件未创建");
 
-      envelop.payload = { ok: true, data: { path, size: f.size } };
+      envelop.payload = { ok: true, data: { path: displayPath(path), size: f.size } };
       return envelop;
     }
 
@@ -311,11 +399,12 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // append_file
     // ============================================================
     if (action === "append_file") {
-      const path = params.path;
+      const rawPath = params.path;
       const content = params.content ?? "";
-      if (!path) return err(envelop, "缺少 path 参数");
+      if (!rawPath) return err(envelop, "缺少 path 参数");
       if (typeof content !== "string") return err(envelop, "content 必须是字符串");
 
+      const path = resolvePath(rawPath);
       await mkdir(dirname(path), { recursive: true });
       if (existsSync(path)) {
         const old = await readFile(path, "utf-8");
@@ -323,7 +412,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       } else {
         await writeFile(path, content, "utf-8");
       }
-      envelop.payload = { ok: true, data: { path, appended: true } };
+      envelop.payload = { ok: true, data: { path: displayPath(path), appended: true } };
       return envelop;
     }
 
@@ -331,13 +420,15 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // edit_file
     // ============================================================
     if (action === "edit_file") {
-      const path = params.path;
+      const rawPath = params.path;
       const find = params.find;
       const replace = params.replace ?? "";
-      if (!path) return err(envelop, "缺少 path 参数");
+      if (!rawPath) return err(envelop, "缺少 path 参数");
       if (!find || typeof find !== "string") return err(envelop, "缺少 find 参数");
       if (typeof replace !== "string") return err(envelop, "replace 必须是字符串");
-      if (!existsSync(path)) return err(envelop, `文件不存在: ${path}`);
+
+      const path = resolvePath(rawPath);
+      if (!existsSync(path)) return err(envelop, `文件不存在: ${rawPath}`);
 
       const content = await readFile(path, "utf-8");
       const idx = content.indexOf(find);
@@ -350,20 +441,27 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 
       envelop.payload = {
         ok: true,
-        data: { path, replaced: true, old_size: content.length, new_size: newContent.length },
+        data: {
+          path: displayPath(path),
+          replaced: true,
+          old_size: content.length,
+          new_size: newContent.length,
+        },
       };
       return envelop;
     }
 
     // ============================================================
-    // apply_patch（统一用 content）
+    // apply_patch
     // ============================================================
     if (action === "apply_patch") {
-      const path = params.path;
+      const rawPath = params.path;
       const patch = params.content;
-      if (!path) return err(envelop, "缺少 path 参数");
+      if (!rawPath) return err(envelop, "缺少 path 参数");
       if (!patch || typeof patch !== "string") return err(envelop, "缺少 content 参数");
-      if (!existsSync(path)) return err(envelop, `文件不存在: ${path}`);
+
+      const path = resolvePath(rawPath);
+      if (!existsSync(path)) return err(envelop, `文件不存在: ${rawPath}`);
 
       const content = await readFile(path, "utf-8");
       const result = applyPatch(content, patch);
@@ -375,7 +473,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       envelop.payload = {
         ok: true,
         data: {
-          path,
+          path: displayPath(path),
           patched: true,
           old_size: content.length,
           new_size: result.result!.length,
@@ -388,8 +486,9 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // list_dir
     // ============================================================
     if (action === "list_dir") {
-      const path = params.path ?? ".";
-      if (!existsSync(path)) return err(envelop, `目录不存在: ${path}`);
+      const rawPath = params.path ?? ".";
+      const path = resolvePath(rawPath);
+      if (!existsSync(path)) return err(envelop, `目录不存在: ${rawPath}`);
       const entries = await readdir(path, { withFileTypes: true });
       const files = await Promise.all(
         entries.map(async (e) => {
@@ -409,7 +508,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
           };
         })
       );
-      envelop.payload = { ok: true, data: { path, files } };
+      envelop.payload = { ok: true, data: { path: displayPath(path), files } };
       return envelop;
     }
 
@@ -417,11 +516,13 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // delete_file
     // ============================================================
     if (action === "delete_file") {
-      const path = params.path;
-      if (!path) return err(envelop, "缺少 path 参数");
-      if (!existsSync(path)) return err(envelop, `路径不存在: ${path}`);
+      const rawPath = params.path;
+      if (!rawPath) return err(envelop, "缺少 path 参数");
+
+      const path = resolvePath(rawPath);
+      if (!existsSync(path)) return err(envelop, `路径不存在: ${rawPath}`);
       await rm(path, { force: true, recursive: true });
-      envelop.payload = { ok: true, data: { path, deleted: true } };
+      envelop.payload = { ok: true, data: { path: displayPath(path), deleted: true } };
       return envelop;
     }
 
@@ -429,9 +530,10 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // exists
     // ============================================================
     if (action === "exists") {
-      const path = params.path;
-      if (!path) return err(envelop, "缺少 path 参数");
-      envelop.payload = { ok: true, data: { path, exists: existsSync(path) } };
+      const rawPath = params.path;
+      if (!rawPath) return err(envelop, "缺少 path 参数");
+      const path = resolvePath(rawPath);
+      envelop.payload = { ok: true, data: { path: displayPath(path), exists: existsSync(path) } };
       return envelop;
     }
 
@@ -439,16 +541,18 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // file_stat
     // ============================================================
     if (action === "file_stat") {
-      const path = params.path;
-      if (!path) return err(envelop, "缺少 path 参数");
-      if (!existsSync(path)) return err(envelop, `路径不存在: ${path}`);
+      const rawPath = params.path;
+      if (!rawPath) return err(envelop, "缺少 path 参数");
+
+      const path = resolvePath(rawPath);
+      if (!existsSync(path)) return err(envelop, `路径不存在: ${rawPath}`);
 
       const s = await stat(path);
       envelop.payload = {
         ok: true,
         data: {
           stat: {
-            name: path.split("/").pop() ?? path,
+            name: path.split(/[\\/]/).pop() ?? path,
             type: s.isDirectory() ? "directory" : "file",
             size: s.size,
             modified_at: s.mtime.toISOString(),
@@ -463,10 +567,11 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // mkdir
     // ============================================================
     if (action === "mkdir") {
-      const path = params.path;
-      if (!path) return err(envelop, "缺少 path 参数");
+      const rawPath = params.path;
+      if (!rawPath) return err(envelop, "缺少 path 参数");
+      const path = resolvePath(rawPath);
       await mkdir(path, { recursive: true });
-      envelop.payload = { ok: true, data: { path, created: true } };
+      envelop.payload = { ok: true, data: { path: displayPath(path), created: true } };
       return envelop;
     }
 
@@ -486,11 +591,11 @@ export function help() {
   return {
     route: "os/file_utils_api",
     description:
-      "文件读写工具，支持读/按行读/写/追加/局部替换/补丁/列目录/删除/检查存在/文件属性/建目录",
+      "文件读写工具，支持读/按行读/写/追加/局部替换/补丁/列目录/删除/检查存在/文件属性/建目录。所有相对路径锚定项目根。",
     input: {
       action:
         "read_file | read_file_lines | write_file | append_file | edit_file | apply_patch | list_dir | delete_file | exists | file_stat | mkdir",
-      path: "文件或目录路径",
+      path: "文件或目录路径（相对路径锚定项目根）",
       content: "写入内容 / patch 内容（write_file / append_file / apply_patch）",
       find: "要查找的旧内容（edit_file，必须唯一匹配）",
       replace: "新内容（edit_file）",

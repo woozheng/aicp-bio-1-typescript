@@ -20,6 +20,8 @@
 
 import { Envelop } from "../../../core/Envelop.js";
 import type { Agent } from "../../../core/Agent.js";
+import * as fs from "fs";
+import * as path from "path";
 
 // ============================================================
 // 常量
@@ -30,6 +32,16 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_CODE_LENGTH = 20000;
 const MAX_ERROR_LENGTH = 1000;
 const MAX_WHITELIST_ERRORS = 2;
+
+// ★ 项目根目录和日志目录（相对本文件：plugins/builtins/tools/aicp_chat.ts）
+// 从本文件往上 4 级到项目根：tools → builtins → plugins → 项目根
+const PROJECT_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
+const LOG_DIR = path.join(PROJECT_ROOT, "logs");
+
+// 确保日志目录存在
+if (!fs.existsSync(LOG_DIR)) {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+}
 
 /**
  * 允许自动安装的包白名单。
@@ -139,7 +151,13 @@ async function execute(envelop, agent) {
 - Bun.which：查找命令
 - Bun.sleep：睡眠
 - require(name)：加载白名单包
-
+═══════════════════════════════════════
+【路径规则 — 重要】
+═══════════════════════════════════════
+⚠️ 沙箱执行时，当前工作目录（CWD）就是项目根。
+⚠️ 相对路径直接写，如 www/、data/、logs/，不要用 process.cwd() 拼接。
+⚠️ 需要写文件时，路径也直接写相对路径，如 data/workspace/xxx.txt。
+⚠️ 文件路径统一用正斜杠 /，不要用反斜杠 \。
 ═══════════════════════════════════════
 【代码自检规则】
 ═══════════════════════════════════════
@@ -397,6 +415,9 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
   // 白名单错误计数器
   let whitelistErrorCount = 0;
 
+  // ★ 本轮迭代的代码文件路径（每次迭代更新）
+  let codeArtifact = "";
+
   // 多轮迭代
   for (let iter = 0; iter < maxIter; iter++) {
     // 调 LLM
@@ -447,6 +468,9 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       continue;
     }
 
+    // ★ 落盘代码文件（每轮都写，方便追溯）
+    codeArtifact = saveCodeToFile(code, iter);
+
     // 安装依赖
     if (packages.length > 0) {
       try {
@@ -462,6 +486,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
             envelop.payload = {
               ok: false,
               error: `连续 ${whitelistErrorCount} 次白名单错误，终止。请改用白名单内的包。原始错误：${errMsg}`,
+              artifact: codeArtifact,
             };
             return envelop;
           }
@@ -481,7 +506,11 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 
     // 执行成功
     if (execResult.ok) {
-      envelop.payload = { ok: true, data: execResult.data };
+      envelop.payload = {
+        ok: true,
+        data: execResult.data,
+        artifact: codeArtifact,        // ★ 成功 → 代码文件
+      };
       return envelop;
     }
 
@@ -492,10 +521,20 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
         envelop.payload = {
           ok: false,
           error: `连续 ${whitelistErrorCount} 次白名单错误，终止。${execResult.error}`,
+          artifact: codeArtifact,
         };
         return envelop;
       }
     }
+
+    // ★ 失败 → 写错误日志，记录错误文件路径
+    const errorArtifact = saveErrorToFile(
+      iter,
+      code,
+      raw,
+      execResult.error ?? "执行失败",
+      whitelistErrorCount
+    );
 
     // 执行失败 → 喂回 LLM
     fullMessages.push({ role: "assistant", content: raw });
@@ -509,8 +548,82 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
   envelop.payload = {
     ok: false,
     error: `达到最大迭代次数 (${maxIter})，任务未完成。`,
+    artifact: codeArtifact,
   };
   return envelop;
+}
+
+// ============================================================
+// ★ 落盘辅助
+// ============================================================
+
+function timestamp(): string {
+  const d = new Date();
+  const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+  return (
+    d.getFullYear().toString() +
+    pad(d.getMonth() + 1) +
+    pad(d.getDate()) +
+    "_" +
+    pad(d.getHours()) +
+    pad(d.getMinutes()) +
+    pad(d.getSeconds()) +
+    "_" +
+    pad(d.getMilliseconds(), 3)
+  );
+}
+
+function saveCodeToFile(code: string, iter: number): string {
+  const filename = `code_cleaned_${timestamp()}_${iter}.js`;
+  const fullPath = path.join(LOG_DIR, filename);
+  try {
+    fs.writeFileSync(fullPath, code, "utf-8");
+    // 返回相对项目根的路径
+    return path.relative(PROJECT_ROOT, fullPath).replace(/\\/g, "/");
+  } catch (e) {
+    console.error(`[saveCodeToFile] 写文件失败: ${e}`);
+    return "";
+  }
+}
+
+function saveErrorToFile(
+  iter: number,
+  code: string,
+  raw: string,
+  error: string,
+  whitelistCount: number
+): string {
+  const errorDir = path.join(LOG_DIR, "llm_errors");
+  if (!fs.existsSync(errorDir)) {
+    fs.mkdirSync(errorDir, { recursive: true });
+  }
+
+  const filename = `error_${timestamp()}.txt`;
+  const fullPath = path.join(errorDir, filename);
+
+  const content = [
+    "=== LLM 执行错误 ===",
+    `时间: ${new Date().toISOString()}`,
+    `Iteration: ${iter + 1}`,
+    `白名单错误计数: ${whitelistCount}`,
+    "",
+    "--- 错误信息 ---",
+    error,
+    "",
+    "--- 代码 ---",
+    code,
+    "",
+    "--- LLM 原始输出 ---",
+    raw,
+  ].join("\n");
+
+  try {
+    fs.writeFileSync(fullPath, content, "utf-8");
+    return path.relative(PROJECT_ROOT, fullPath).replace(/\\/g, "/");
+  } catch (e) {
+    console.error(`[saveErrorToFile] 写文件失败: ${e}`);
+    return "";
+  }
 }
 
 // ============================================================
@@ -792,6 +905,7 @@ export function help() {
       ok: "是否成功",
       data: "执行结果",
       error: "错误信息",
+      artifact: "落盘文件路径（成功=代码文件，失败=错误文件）",
     },
     features: [
       "白名单 API：fetch / Bun.file / Bun.write / Bun.spawn / Bun.$ / Bun.sqlite / Bun.Glob / Bun.which",
@@ -804,6 +918,7 @@ export function help() {
       "死循环检测：静态检测 while(true) / for(;;)，拒绝执行",
       "白名单错误上限：连续 2 次白名单错误终止",
       "★ 图片分析：支持 content 数组格式传图给多模态模型",
+      "★ artifact：返回落盘文件路径（成功=代码，失败=错误文件）",
     ],
   };
 }
