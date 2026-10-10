@@ -175,17 +175,10 @@ input::placeholder,textarea::placeholder{color:#555}
                 </div>
             </div>
 
-                        <div class="card">
+            <div class="card">
                 <div class="card-title"><span class="left">🔌 WebSocket</span></div>
                 <div class="form-row">
                     <label>external_url</label><input id="cfgWsUrl" placeholder="ws://127.0.0.1:9001/ws">
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-title"><span class="left">📤 文件上传</span></div>
-                <div class="form-row">
-                    <label>external_url</label><input id="cfgUploadUrl" placeholder="http://127.0.0.1:9002/upload">
                 </div>
             </div>
 
@@ -382,8 +375,7 @@ async function loadEngineConfig(){
         document.getElementById('cfgStaticDir').value = config.static_dir || 'www';
         document.getElementById('cfgDataDir').value = config.data_dir || 'data';
         document.getElementById('cfgPluginsDir').value = config.plugins_dir || 'plugins';
-               document.getElementById('cfgWsUrl').value = (config.websocket||{}).external_url || 'ws://127.0.0.1:9001/ws';
-        document.getElementById('cfgUploadUrl').value = (config.upload||{}).external_url || 'http://127.0.0.1:9002/upload';
+        document.getElementById('cfgWsUrl').value = (config.websocket||{}).external_url || 'ws://127.0.0.1:9001/ws';
         document.getElementById('cfgEnableAuth').value = String(config.enable_auth || false);
         document.getElementById('cfgTokens').value = (config.tokens || []).join('\n');
         document.getElementById('cfgStudioToken').value = config.studio_token || '';
@@ -392,14 +384,13 @@ async function loadEngineConfig(){
 }
 
 async function saveEngineConfig(){
-      const updates = {
+    const updates = {
         host: document.getElementById('cfgHost').value||'0.0.0.0',
         port: parseInt(document.getElementById('cfgPort').value)||9000,
         static_dir: document.getElementById('cfgStaticDir').value||'www',
         data_dir: document.getElementById('cfgDataDir').value||'data',
         plugins_dir: document.getElementById('cfgPluginsDir').value||'plugins',
         websocket: {external_url: document.getElementById('cfgWsUrl').value},
-        upload: {external_url: document.getElementById('cfgUploadUrl').value},
         enable_auth: document.getElementById('cfgEnableAuth').value === 'true',
         tokens: document.getElementById('cfgTokens').value.split('\n').map(s=>s.trim()).filter(Boolean),
         studio_token: document.getElementById('cfgStudioToken').value,

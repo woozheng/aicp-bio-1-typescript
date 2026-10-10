@@ -364,7 +364,7 @@ async function clearCurrentSkill() {
   btn.textContent = '卸载中...';
 
   try {
-    var resp = await fetch('/api/builtins/tools/load_skill', {
+    var resp = await fetch('/api/builtins/tools/skill_loader', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({

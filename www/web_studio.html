@@ -137,77 +137,11 @@ async function loadProjects(){try{const d=await api('list_projects');const s=doc
 async function selectProject(name){currentProject=name;localStorage.setItem('aicp_current_project',name);await refreshFileTree();document.getElementById('statusBar').textContent=name?`📁 当前项目: ${name}`:'就绪';}
 async function newProject(){const n=prompt('项目名称（英文）:');if(!n)return;await api('write_file',{path:`plugins/applications/${n}/app.yaml`,content:`name: ${n}\nversion: 1.0.0\nauto_start: false\ninit_action: init\n`});await api('write_file',{path:`www/${n}/index.html`,content:'<h1>Hello AICP</h1>'});await loadProjects();selectProject(n);}
 
-async function refreshFileTree(){
-  if(!currentProject)return;
-  const t=document.getElementById('fileTree');
-  try{
-    const d=await api('list_files',{app_id:currentProject});
-    t.innerHTML='';
-
-    // ★ 三棵树：plugins / www_plugin / www
-const sections = [
-  { key: 'plugins',    label: 'src/plugins/applications/' },
-  { key: 'www_plugin', label: 'src/plugins/www/' },
-  { key: 'www',        label: 'www/' },
-];
-
-    let total = 0;
-    sections.forEach(({ key, label }) => {
-      const f = d.tree?.[key] || [];
-      if (!f.length) return;
-      total += f.length;
-       t.innerHTML += `<div class="item dir" onclick="toggleDir(this)">${label}</div>`;
-      const div = document.createElement('div');
-      f.forEach(i => {
-        const ind = (i.name.split('/').length - 1) * 12 + 12;
-        div.innerHTML += `<div class="item ${i.dir ? 'dir' : 'file'}" style="padding-left:${ind}px" onclick="${i.dir ? '' : 'openFile(\'' + i.path + '\')'}">${i.dir ? '📁' : '📄'} ${i.name.split('/').pop()}</div>`;
-      });
-      t.appendChild(div);
-    });
-
-    if (total === 0) {
-      t.innerHTML = '<div style="color:#a0a0a0;padding:12px;">暂无文件</div>';
-    }
-  } catch(e) {}
-}
+async function refreshFileTree(){if(!currentProject)return;const t=document.getElementById('fileTree');try{const d=await api('list_files',{app_id:currentProject});t.innerHTML='';['www','plugins'].forEach(s=>{const f=d.tree?.[s]||[];if(!f.length)return;t.innerHTML+=`<div class="item dir" onclick="toggleDir(this)">📂 ${s}/</div>`;const div=document.createElement('div');f.forEach(i=>{const ind=(i.name.split('/').length-1)*12+12;div.innerHTML+=`<div class="item ${i.dir?'dir':'file'}" style="padding-left:${ind}px" onclick="${i.dir?'':'openFile(\''+i.path+'\')'}">${i.dir?'📁':'📄'} ${i.name.split('/').pop()}</div>`;});t.appendChild(div);});if(!d.tree?.www?.length&&!d.tree?.plugins?.length){t.innerHTML='<div style="color:#a0a0a0;padding:12px;">暂无文件</div>';}}catch(e){}}
 function toggleDir(el){const n=el.nextElementSibling;if(n&&n.tagName==='DIV'){n.style.display=n.style.display==='none'?'block':'none';el.textContent=el.textContent.replace(/^[📁📂]/,n.style.display==='none'?'📁':'📂');}}
 
-async function openFile(path) {
-  const e = path.split('.').pop().toLowerCase();
+async function openFile(path){const e=path.split('.').pop().toLowerCase();if(['png','jpg','jpeg','gif','webp','mp4','mp3','wav','zip'].includes(e)){window.open(`${ENGINE}/${currentProject}/${path.split('/').pop()}`,'_blank');return;}try{const d=await api('read_file',{path});const m={py:'python',md:'markdown',yaml:'yaml',yml:'yaml',html:'html',htm:'html',css:'css',js:'javascript',json:'json',xml:'xml',txt:'plaintext'};monaco.editor.setModelLanguage(editor.getModel(),m[e]||'plaintext');editor.setValue(d.content||'');document.getElementById('editorFileName').textContent=path.split('/').pop();currentFile=path;}catch(e){}}
 
-  // 图片 / 视频 / 压缩包：用 URL 打开
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'mp3', 'wav', 'zip'].includes(e)) {
-    // ★ path 可能是 "www/{项目}/xxx" 或 "src/plugins/..."
-    // 如果是 www/，转成 URL
-    if (path.startsWith('www/')) {
-      const rel = path.replace(/^www\//, '');
-      window.open(`${ENGINE}/${rel}`, '_blank');
-    } else {
-      // 其他情况：提示或直接用路径
-      window.open(`${ENGINE}/${path}`, '_blank');
-    }
-    return;
-  }
-
-  // 文本文件：Monaco 打开
-  try {
-    const d = await api('read_file', { path });
-    const m = {
-      py: 'python', md: 'markdown',
-      yaml: 'yaml', yml: 'yaml',
-      html: 'html', htm: 'html',
-      css: 'css',
-      js: 'javascript', ts: 'typescript', tsx: 'typescript', jsx: 'javascript',
-      json: 'json', xml: 'xml', svg: 'xml',
-      sh: 'shell', bash: 'shell',
-      toml: 'ini', txt: 'plaintext',
-    };
-    monaco.editor.setModelLanguage(editor.getModel(), m[e] || 'plaintext');
-    editor.setValue(d.content || '');
-    document.getElementById('editorFileName').textContent = path.split('/').pop();
-    currentFile = path;
-  } catch(e) {}
-}
 async function saveFile(){if(!currentFile)return;await api('write_file',{path:currentFile,content:editor.getValue()});document.getElementById('statusBar').textContent=`✅ 已保存: ${currentFile}`;}
 async function deleteFile(){if(!currentFile||!confirm('确认删除？'))return;await api('delete_file',{path:currentFile});currentFile=null;editor.setValue('');document.getElementById('editorFileName').textContent='未打开文件';refreshFileTree();}
 

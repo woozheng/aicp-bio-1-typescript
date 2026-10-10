@@ -261,9 +261,9 @@ body {
 <div class="container">
   <div class="hero">
     <h1>⚡ AICP BIO-1</h1>
-    <div class="subtitle">自举、自进化的AI Agent</div>
+    <div class="subtitle">自举、自进化的AI-Agent</div>
     <div class="badge-row">
-      <img src="https://img.shields.io/badge/TypeScript-Reference_Implementation-blue?style=flat-square&logo=typescript" alt="TypeScript Reference" style="height:20px;vertical-align:middle;">
+      <img id="backendBadgeImg" src="" alt="" style="height:20px;vertical-align:middle;display:none;">
     </div>
     <div class="login-inline">
       <input type="password" id="tokenInput" placeholder="🔑 访问密钥" autofocus>
@@ -286,6 +286,56 @@ body {
 <div class="page-menu-dropdown" id="pageMenuDropdown"></div>
 
 <script>
+// ============================================================
+// 后端感知
+// ============================================================
+
+var BACKEND_INFO = { language: 'unknown', runtime: '', version: '', protocol_version: '', features: [] };
+
+async function detectBackend() {
+    try {
+        var r = await fetch('/api/backend_info', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        BACKEND_INFO = Object.assign(BACKEND_INFO, await r.json());
+    } catch (e) {
+        console.warn('[AICP] detect backend failed:', e);
+    }
+    applyBackendBadge();
+}
+
+function applyBackendBadge() {
+    var img = document.getElementById('backendBadgeImg');
+    if (!img) return;
+
+    var badgeMap = {
+        'java': {
+            src: 'https://img.shields.io/badge/Java-Implementation-orange?style=flat-square&logo=openjdk',
+            alt: 'Java Implementation'
+        },
+        'python': {
+            src: 'https://img.shields.io/badge/Python-Reference_Implementation-blue?style=flat-square&logo=python',
+            alt: 'Python Reference'
+        },
+        'typescript': {
+            src: 'https://img.shields.io/badge/TypeScript-Reference_Implementation-blue?style=flat-square&logo=typescript',
+            alt: 'TypeScript Reference'
+        }
+    };
+
+    var lang = (BACKEND_INFO.language || '').toLowerCase();
+    var badge = badgeMap[lang];
+
+    if (badge) {
+        img.src = badge.src;
+        img.alt = badge.alt;
+        img.title = badge.alt + (BACKEND_INFO.runtime ? ' · ' + BACKEND_INFO.runtime : '');
+        img.style.display = 'inline-block';
+    } else {
+        img.style.display = 'none';
+    }
+
+    console.log('[AICP] Backend:', BACKEND_INFO);
+}
 function login() {
   var token = document.getElementById('tokenInput').value.trim();
   if (!token) return;
@@ -296,7 +346,7 @@ function login() {
   .then(data => {
     if (data.ok) {
       document.cookie = 'aicp_token=' + token + '; path=/; max-age=2592000';
-       location.href = new URLSearchParams(location.search).get('redirect') || '/console/';
+      location.href = new URLSearchParams(location.search).get('redirect') || '/';
     } else {
       document.getElementById('errorMsg').style.display = 'block';
     }
@@ -312,10 +362,8 @@ function showPageMenu(btn, pages) {
   var dropdown = document.getElementById('pageMenuDropdown');
   var rect = btn.getBoundingClientRect();
   dropdown.innerHTML = pages.map(function(p) {
-    // ★ 用 p.url
-    var url = p.url || ('/' + p.path.replace(/\/index\.html$/, '/'));
-    var pageName = url.replace(/^\/|\/$/g, '') || 'index';
-    return '<a href="' + url + '" target="_blank">📄 ' + pageName + '</a>';
+    var pageName = p.path.split('/').pop().replace('.html', '');
+    return '<a href="/' + p.path + '" target="_blank">📄 ' + pageName + '</a>';
   }).join('');
   dropdown.style.top = rect.bottom + 4 + 'px';
   dropdown.style.left = rect.left + 'px';
@@ -355,8 +403,8 @@ async function loadAppGallery() {
 
     var pagesResp = await fetch('/api/pages');
     var pagesData = await pagesResp.json();
-   var allPages = (pagesData.pages || []).filter(function(p) {
-    return p.is_system !== true;   // ← 过滤系统页面
+    var allPages = (pagesData.pages || []).filter(function(p) {
+      return p.path !== 'index.html' && p.path !== 'login.html' && p.path.includes('/');
     });
 
     var appPageMap = {};
@@ -371,21 +419,20 @@ async function loadAppGallery() {
       var info = appInfoMap[name] || {};
       var pages = appPageMap[name];
       var mainPage = pages.find(function(p) { return p.path.endsWith('/index.html'); }) || pages[0];
-    var mainPage = pages.find(function(p) { return p.path.endsWith('/index.html'); }) || pages[0];
-    apps.push({
+      apps.push({
         name: name,
         title: info.title && info.title !== 'App' ? info.title : name,
         desc: info.summary && info.summary !== '?' ? info.summary : '',
         is_frontend: info.is_frontend || false,
-        url: mainPage.url || ('/' + mainPage.path.replace(/\/index\.html$/, '/')),   // ★ 用 url
+        url: '/' + mainPage.path,
         pageCount: pages.length,
         pages: pages
-    });
+      });
     }
 
     var grid = document.getElementById('appGrid');
     if (apps.length === 0) { grid.innerHTML = '<div class="loading-text">暂无应用</div>'; return; }
-    
+
     grid.innerHTML = apps.map(function(a) {
       var icon = a.is_frontend ? '🌐' : '📦';
       return '<div class="app-card" onclick="window.open(\'' + a.url + '\',\'_blank\')">' +
@@ -393,8 +440,8 @@ async function loadAppGallery() {
         '<div class="app-desc">' + (a.desc || a.name) + '</div>' +
         '<div class="app-meta">' +
           '<span>' + a.name + '</span>' +
-          (a.pageCount > 1 
-            ? '<button class="page-menu-btn" data-pages=\'' + JSON.stringify(a.pages) + '\'>' + a.pageCount + ' 页 ▾</button>' 
+          (a.pageCount > 1
+            ? '<button class="page-menu-btn" data-pages=\'' + JSON.stringify(a.pages) + '\'>' + a.pageCount + ' 页 ▾</button>'
             : '<span>1 页</span>') +
         '</div>' +
       '</div>';
@@ -411,7 +458,10 @@ async function loadAppGallery() {
     document.getElementById('appGrid').innerHTML = '<div class="loading-text">加载失败</div>';
   }
 }
-loadAppGallery();
+// ★ 先探测后端，再加载应用广场
+detectBackend().then(function() {
+    loadAppGallery();
+});
 </script>
 </body>
 </html>

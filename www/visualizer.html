@@ -196,12 +196,6 @@ var getSessionId = function() {
 var SESSION_ID = getSessionId();
 var CHANNEL = 'pa_visualizer';
 
-// ★ 后端注入的 WebSocket URL（www/_visualizer 插件替换 __WS_URL__）
-var WS_URL = "__WS_URL__";
-if (WS_URL === "__WS_URL__" || !WS_URL) {
-    WS_URL = 'ws://' + location.hostname + ':' + (parseInt(location.port || 9000) + 1) + '/ws';
-}
-
 // ============================================================
 // 状态
 // ============================================================
@@ -245,6 +239,7 @@ window.addEventListener('resize', resize);
 // 启动节点：钉住两个网关
 // ============================================================
 function bootstrapNodes() {
+    // HTTP 网关（入口） — 左侧
     var gateway = ensureNode('os/_gateway');
     gateway.type = 'gateway';
     gateway.x = W / 2 - 110;
@@ -252,6 +247,7 @@ function bootstrapNodes() {
     gateway.pinned = true;
     gateway.alpha = 1;
 
+    // WebSocket 网关（出口） — 右侧
     var wsGateway = ensureNode('os/_websocket');
     wsGateway.type = 'wsgateway';
     wsGateway.x = W / 2 + 110;
@@ -341,8 +337,10 @@ function handleEnvelop(evt) {
     var intent = evt.intent || '';
     var direction = evt.direction || 'out';
 
+    // 可视化自身的事件不再触发新粒子
     if (from === 'os/_visualizer') return;
 
+    // ★ 根据 direction 决定粒子方向
     var particleFrom = direction === 'in' ? to : from;
     var particleTo = direction === 'in' ? from : to;
 
@@ -367,6 +365,7 @@ function handleEnvelop(evt) {
     if (isGateway) links[linkKey].kind = 'gateway';
     else if (isAsync) links[linkKey].kind = 'async';
 
+    // ★ 返回用绿色；出口网关用紫色
     var color;
     if (direction === 'in') {
         color = '#10b981';
@@ -657,7 +656,7 @@ function loop() {
 }
 
 // ============================================================
-// WebSocket（后端注入 __WS_URL__，不再 fetch ws_config）
+// WebSocket（对齐 index.html 的连接方式）
 // ============================================================
 var ws = null;
 var wsHeartbeat = null;
@@ -666,48 +665,53 @@ var reconnectTimer = null;
 
 function connectWS() {
     var wsChannel = CHANNEL;
-    var wsToken = 'visualizer';
-    ws = new WebSocket(WS_URL + '?channel=' + wsChannel + '&token=' + encodeURIComponent(wsToken));
+    fetch('/api/ws_config').then(function(r) { return r.json(); }).then(function(data) {
+        var url = data.url || 'ws://' + location.hostname + ':' + (parseInt(location.port || 9000) + 1) + '/ws';
+        ws = new WebSocket(url + '?channel=' + wsChannel);
 
-    ws.onopen = function() {
-        document.getElementById('wsBadge').textContent = '已连接';
-        document.getElementById('wsBadge').style.color = '#10b981';
-        document.getElementById('wsStatus').innerHTML = '<span class="dot green"></span>已连接';
-        updatePanelStats();
+        ws.onopen = function() {
+            document.getElementById('wsBadge').textContent = '已连接';
+            document.getElementById('wsBadge').style.color = '#10b981';
+            document.getElementById('wsStatus').innerHTML = '<span class="dot green"></span>已连接';
+            updatePanelStats();
 
-        reconnectDelay = 3000;
+            reconnectDelay = 3000;
 
-        if (wsHeartbeat) clearInterval(wsHeartbeat);
-        wsHeartbeat = setInterval(function() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'ping' }));
-            }
-        }, 15000);
-    };
+            if (wsHeartbeat) clearInterval(wsHeartbeat);
+            wsHeartbeat = setInterval(function() {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping' }));
+                }
+            }, 15000);
+        };
 
-    ws.onmessage = function(e) {
-        try {
-            var msg = JSON.parse(e.data);
-            if (msg.type === 'pong') return;
-            var data = msg.data || msg;
-            if (data.type === 'envelop') {
-                handleEnvelop(data);
-            }
-        } catch(err) {}
-    };
+        ws.onmessage = function(e) {
+            try {
+                var msg = JSON.parse(e.data);
+                if (msg.type === 'pong') return;
+                var data = msg.data || msg;
+                if (data.type === 'envelop') {
+                    handleEnvelop(data);
+                }
+            } catch(err) {}
+        };
 
-    ws.onclose = function() {
-        document.getElementById('wsBadge').textContent = '重连中';
-        document.getElementById('wsBadge').style.color = '#f59e0b';
-        document.getElementById('wsStatus').innerHTML = '<span class="dot red"></span>已断开';
+        ws.onclose = function() {
+            document.getElementById('wsBadge').textContent = '重连中';
+            document.getElementById('wsBadge').style.color = '#f59e0b';
+            document.getElementById('wsStatus').innerHTML = '<span class="dot red"></span>已断开';
 
-        if (wsHeartbeat) { clearInterval(wsHeartbeat); wsHeartbeat = null; }
+            if (wsHeartbeat) { clearInterval(wsHeartbeat); wsHeartbeat = null; }
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(connectWS, reconnectDelay);
+            if (reconnectDelay < 30000) reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+        };
+
+        ws.onerror = function() {};
+    }).catch(function() {
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(connectWS, reconnectDelay);
-        if (reconnectDelay < 30000) reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
-    };
-
-    ws.onerror = function() {};
+    });
 }
 
 // ============================================================
