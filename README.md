@@ -186,6 +186,7 @@ See [PROTOCOL.md](https://github.com/woozheng/aicp)for the full protocol.
 ## Other Implementations
 
 - **Python**: [aicp-bio-1-python](https://github.com/woozheng/aicp-bio-1-python)
+- **Java**: [aicp-bio-1-java](https://github.com/woozheng/aicp-bio-1-java)
 
 Both implementations follow the same protocol.
 
@@ -208,6 +209,3 @@ AICP-BIO-1 is in developer preview and iterating rapidly. There will be breaking
 ## License
 
 [MIT](./LICENSE)
-
-
-

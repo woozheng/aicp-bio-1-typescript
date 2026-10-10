@@ -185,6 +185,7 @@ execute(envelop, agent) → envelop
 ## 其他实现
 
 Python：[aicp-bio-1-python](https://github.com/woozheng/aicp-bio-1-python)
+Java：[aicp-bio-1-java](https://github.com/woozheng/aicp-bio-1-java)
 
 两个实现遵守同一协议。
 
@@ -207,6 +208,3 @@ AICP-BIO-1 处于开发者预览阶段，迭代迅速。会有破坏性变更。
 ## 许可
 
 MIT
-
-
-
