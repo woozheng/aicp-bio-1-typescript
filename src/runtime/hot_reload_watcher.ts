@@ -2,10 +2,10 @@
  * Hot Reload Watcher — 自动检测插件变化并重载
  */
 
-import { readdir, stat, readFile, copyFile, unlink } from "node:fs/promises";
+import { readdir, stat, readFile, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, relative, dirname, extname } from "node:path";
+import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { plugins } from "../core/plugins.js";
 import { Envelop } from "../core/Envelop.js";
@@ -22,6 +22,10 @@ const _hashCache: Map<string, string> = new Map();
 
 // ★ 记录已经警告过的路由，避免重复刷屏
 const _warnedNoExecute: Set<string> = new Set();
+
+// ★ 失败重试计数（避免语法错误时每 2 秒刷屏）
+const _retryCount: Map<string, number> = new Map();
+const MAX_RETRY = 5;
 
 let _system: SystemServer | null = null;
 let _pluginsDir = "src/plugins";
@@ -90,6 +94,7 @@ async function handleNew(filePath: string, mtime: number): Promise<void> {
   try {
     const s = await stat(filePath);
     if (s.mtimeMs !== mtime) return;
+    if (s.size === 0) return;              // ★ 空文件跳过，等下次 tick
   } catch {
     return;
   }
@@ -98,16 +103,26 @@ async function handleNew(filePath: string, mtime: number): Promise<void> {
   const hash = await calcHash(filePath);
   const ok = await loadPlugin(filePath, route, false);
 
-  // ★ 无论成功失败，都更新 mtime 和 hash（避免反复重试）
-  _mtimeCache.set(filePath, mtime);
-  _hashCache.set(filePath, hash);
-
   if (ok) {
-    await deleteContractFile(filePath);   //
+    _mtimeCache.set(filePath, mtime);
+    _hashCache.set(filePath, hash);
+    _retryCount.delete(filePath);
+    await deleteContractFile(filePath);
     console.log(`[HotReload] New plugin: ${route}`);
     await notifyRegistry(route);
+  } else {
+    // ★ 失败不缓存 mtime/hash，下个 tick 自动重试（loadPlugin 每次用新 URL）
+    const n = (_retryCount.get(filePath) ?? 0) + 1;
+    _retryCount.set(filePath, n);
+    if (n >= MAX_RETRY) {
+      _mtimeCache.set(filePath, mtime);
+      _hashCache.set(filePath, hash);
+      _retryCount.delete(filePath);
+      console.warn(`[HotReload] Give up after ${n} retries: ${route}`);
+    } else {
+      console.warn(`[HotReload] Retry ${n}/${MAX_RETRY}: ${route}`);
+    }
   }
-  // 失败时不打日志（loadPlugin 内部已处理）
 }
 
 // ============================================================
@@ -134,16 +149,25 @@ async function handleModified(filePath: string, mtime: number): Promise<void> {
   const route = calcRoute(filePath);
   const ok = await loadPlugin(filePath, route, true);
 
-  // ★ 无论成功失败，都更新 mtime 和 hash
-  _mtimeCache.set(filePath, mtime);
-  _hashCache.set(filePath, hash);
-
   if (ok) {
-     await deleteContractFile(filePath);   //
+    _mtimeCache.set(filePath, mtime);
+    _hashCache.set(filePath, hash);
+    _retryCount.delete(filePath);
+    await deleteContractFile(filePath);
     console.log(`[HotReload] Reloaded: ${route}`);
     await notifyRegistry(route);
   } else {
-    console.warn(`[HotReload] ${route} not loaded (keeping old version)`);
+    // ★ 失败不更新 mtime/hash，下个 tick 重试
+    const n = (_retryCount.get(filePath) ?? 0) + 1;
+    _retryCount.set(filePath, n);
+    if (n >= MAX_RETRY) {
+      _mtimeCache.set(filePath, mtime);
+      _hashCache.set(filePath, hash);
+      _retryCount.delete(filePath);
+      console.warn(`[HotReload] Give up after ${n} retries: ${route}`);
+    } else {
+      console.warn(`[HotReload] ${route} not loaded (retry ${n}/${MAX_RETRY})`);
+    }
   }
 }
 
@@ -155,7 +179,8 @@ async function handleRemoved(filePath: string): Promise<void> {
   const route = calcRoute(filePath);
   _mtimeCache.delete(filePath);
   _hashCache.delete(filePath);
-  _warnedNoExecute.delete(route);  // ★ 清理警告记录
+  _retryCount.delete(filePath);          // ★ 清理重试计数
+  _warnedNoExecute.delete(route);        // ★ 清理警告记录
 
   if (plugins.has(route)) {
     plugins.delete(route);
@@ -179,19 +204,11 @@ async function scanAll(): Promise<Map<string, number>> {
  * ★ 判断是否是可加载的插件文件
  */
 function isPluginFile(name: string): boolean {
-  // 必须是 .ts 或 .js
   if (!name.endsWith(".ts") && !name.endsWith(".js")) return false;
-
-  // 排除 .d.ts
   if (name.endsWith(".d.ts")) return false;
-
-  // 排除测试文件
   if (name.includes(".test.")) return false;
   if (name.includes(".spec.")) return false;
-
-  // 排除 .contract.json 等（虽然上面已经排除了非 .ts/.js）
   if (name.endsWith(".contract.json")) return false;
-
   return true;
 }
 
@@ -206,7 +223,6 @@ async function walk(dir: string, result: Map<string, number>): Promise<void> {
   }
 
   for (const entry of entries) {
-    // 跳过隐藏文件、临时文件、特殊目录
     if (entry.name.startsWith(".")) continue;
     if (entry.name.startsWith("hotreload_")) continue;
     if (entry.name === "node_modules") continue;
@@ -252,26 +268,18 @@ async function loadPlugin(
   route: string,
   force: boolean = false
 ): Promise<boolean> {
-  let tmpPath: string | null = null;
-
   try {
-    const absPath = join(process.cwd(), filePath);
-    let importPath = absPath;
-
-    if (force) {
-      const dir = dirname(absPath);
-      const ext = extname(absPath);
-      const tmpName = `hotreload_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
-      tmpPath = join(dir, tmpName);
-      await copyFile(absPath, tmpPath);
-      importPath = tmpPath;
+    let absPath = join(process.cwd(), filePath);
+    // ★ Windows 盘符统一大写，避免 e:/E: 两种 URL
+    if (/^[a-z]:/.test(absPath)) {
+      absPath = absPath[0].toUpperCase() + absPath.slice(1);
     }
+    // ★ 时间戳 + 随机数，URL 绝对唯一，绕开所有缓存
+    const url = pathToFileURL(absPath).href + `?t=${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    const url = pathToFileURL(importPath).href;
     const module = await import(url);
 
     if (typeof module.execute !== "function") {
-      // ★ 只在第一次警告，避免刷屏
       if (!_warnedNoExecute.has(route)) {
         _warnedNoExecute.add(route);
         console.log(`[HotReload] Skip (no execute): ${route}`);
@@ -279,19 +287,12 @@ async function loadPlugin(
       return false;
     }
 
-    // ★ 加载成功后，清掉警告记录（下次再没 execute 会重新警告）
     _warnedNoExecute.delete(route);
-
     plugins.set(route, module.execute);
     return true;
   } catch (e: any) {
-    // 加载失败（语法错误等）
     console.warn(`[HotReload] Failed to load ${route}: ${e.message}`);
     return false;
-  } finally {
-    if (tmpPath) {
-      try { await unlink(tmpPath); } catch {}
-    }
   }
 }
 
@@ -316,9 +317,8 @@ async function notifyRegistry(route: string): Promise<void> {
 // ============================================================
 // 工具
 // ============================================================
+
 async function deleteContractFile(filePath: string): Promise<void> {
-  // filePath 是 .ts 文件路径
-  // 契约文件同目录，同前缀，后缀 .contract.json
   const contractPath = filePath.replace(/\.(ts|js)$/, ".contract.json");
   if (existsSync(contractPath)) {
     try {
@@ -329,6 +329,7 @@ async function deleteContractFile(filePath: string): Promise<void> {
     }
   }
 }
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }

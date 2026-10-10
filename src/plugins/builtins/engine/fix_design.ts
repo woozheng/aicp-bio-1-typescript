@@ -22,7 +22,6 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
 - 文件末尾有 help() 函数，声明 route / description / input / output / streaming
 
 前端：
-- src/plugins/www/{项目名}.ts（前端插件，模板生成，不用改）
 - www/{项目名}/index.html（实际页面）
 - 前端调用后端：fetch('/api/applications/{项目名}/xxx', { payload: { action: 'xxx', ... } })
 
@@ -34,28 +33,49 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
 
 先判断 mode，再判断 scope。
 
-### mode=local（局部改）
-
-- 改字段、改样式、改交互、改参数、改文案
-- 不涉及新 import、新函数、新协议
-- 改动局限在现有函数 / 现有 DOM 内
-- 例：「按钮改大点」「加个 priority 字段」「列表加筛选」「改文案」
-
 ### mode=regenerate（重生成）
 
-- 涉及新协议（流式、WebSocket、定时、文件上传、认证）
-- 涉及新结构（多 action 协作、状态机、队列、工作流）
-- 涉及多个文件
-- 现有代码可能要"重构"才能实现
-- 例：「加流式输出」「加 WebSocket 推送」「加定时任务」「改成多步骤工作流」
+**新增协议 / 结构性变更**：
+
+- **原来没有** WebSocket，现在要加 → regenerate
+- **原来没有** 流式，现在要加 → regenerate
+- **原来没有** 定时任务，现在要加 → regenerate
+- **原来没有** 文件上传，现在要加 → regenerate
+- **原来没有** 认证，现在要加 → regenerate
+- **原来只有 1 个 action，现在要多个 action 协作** → regenerate
+- **需要重构现有代码** 才能实现 → regenerate
+- **涉及多个文件的结构性改动** → regenerate
+
+### mode=local（局部改）
+
+**修复 / 调整已有功能**：
+
+- **原来有** WebSocket，改 channel / 改消息格式 / 改重连逻辑 → local
+- **原来有** 流式，改接收逻辑 / 改展示 → local
+- **原来有** 定时任务，改间隔 / 改条件 → local
+- **原来有** 文件上传，改上传逻辑 / 改存储 → local
+- 改字段 / 改样式 / 改交互 / 改文案 → local
+- 加小功能（不涉及新协议）→ local
+- 加字段 / 加显示 / 加筛选 / 调整顺序 / 改颜色 → local
 
 ### 判断规则
 
 关键词识别：
-- local：改 / 调 / 加字段 / 加显示 / 加筛选 / 改样式 / 改文案 / 改顺序 / 改颜色
-- regenerate：加流式 / 加实时 / 加推送 / 加定时 / 加认证 / 加文件上传 / 重构 / 重写
 
-不确定时：**默认 regenerate**（更稳，LLM 有完整协议）。
+- **regenerate**：**新增**流式 / **新增**实时 / **新增**推送 / **新增**定时 / **新增**认证 / **新增**文件上传 / 重构 / 重写 / 改成多步骤
+- **local**：改 / 调 / 修 / 修复 / 调整 / 加字段 / 加显示 / 加筛选 / 改样式 / 改文案 / 改顺序 / 改颜色
+
+**关键区分**：
+
+- "加 WebSocket 推送" → 如果原来**没有** → \`regenerate\`；如果原来**有** → \`local\`
+- "修复 WebSocket 断线重连" → \`local\`
+- "改 WebSocket channel" → \`local\`
+- "加流式输出" → 如果原来**没有** → \`regenerate\`；如果原来**有** → \`local\`
+- "调整按钮颜色" → \`local\`
+- "加一个筛选功能" → \`local\`
+- "改成多步骤工作流" → \`regenerate\`
+
+不确定时：**默认 local**（避免不必要的全量重生成）。
 
 ## ★ 判断 scope（backend / frontend / both）
 
@@ -78,13 +98,16 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
 项目可能有多个后端文件。你必须判断「issue 涉及哪个文件」。
 
 判断依据：
-1. 看「后端文件摘要」里每个文件的功能
+
+1. 看「后端文件列表」里每个文件的功能描述
 2. 看「后端完整源码」里 issue 相关的代码在哪个文件
 3. 如果 issue 涉及多个文件，输出多个 backend_changes（local 模式）
 
-**禁止**：只写一个文件而不分析其他文件。
-**禁止**：不指定 file 字段。
-**禁止**：file 字段写 "api.ts"（除非实际文件名就是 api.ts）。
+**禁止**：
+
+- 只写一个文件而不分析其他文件
+- 不指定 file 字段
+- file 字段写不在「后端文件列表」里的名字（幻觉）
 
 ## 输出格式
 
@@ -116,7 +139,7 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
 {
   "mode": "regenerate",
   "scope": "both",
-  "reason": "加流式输出需要前后端重构，LLM 需要完整协议",
+  "reason": "原来没有流式，现在要加，需要前后端重构",
   "backend_spec": {
     "name": "chat_api",
     "description": "对话 API，支持 chat / history / chat_stream（流式）"
@@ -152,7 +175,7 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
    - backend_spec / frontend_spec 必须非空（除非对应端不存在）
    - backend_changes / frontend_changes 填"要改什么"（给 generate 当上下文）
    - description 要说明"保留什么，新增什么"
-5. backend_changes[].file：必须是「后端文件摘要」里列出的实际文件名
+5. backend_changes[].file：必须是「后端文件列表」里列出的实际文件名
 6. frontend_changes[].file：固定 "index.html"
 7. backend_changes[].actions_affected：受影响的 action 名列表
 8. 只输出 JSON，不要代码块标记，不要解释
@@ -163,7 +186,7 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
 项目名：workflow_builder
 修复需求：前端画布不能连线，节点 handle 没绑事件
 
-后端文件摘要：
+后端文件列表：
 - node_type_api.ts：节点类型注册表
 - workflow_api.ts：工作流 CRUD
 - workflow_execute_api.ts：工作流执行引擎
@@ -190,7 +213,7 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
 项目名：workflow_builder
 修复需求：循环节点执行时没有正确遍历 items
 
-后端文件摘要：
+后端文件列表：
 - node_type_api.ts：节点类型注册表
 - workflow_api.ts：工作流 CRUD
 - workflow_execute_api.ts：工作流执行引擎
@@ -216,16 +239,16 @@ export const FIX_DESIGN_SYSTEM = `你是 AICP 修复方案设计师。你的唯�
 
 输入：
 项目名：chat_app
-修复需求：给对话加流式输出（打字机效果）
+修复需求：给对话加流式输出（打字机效果）—— 原来没有流式
 
-后端文件摘要：
+后端文件列表：
 - chat_api.ts：对话 API（action: chat / history）
 
 输出：
 {
   "mode": "regenerate",
   "scope": "both",
-  "reason": "加流式输出是结构性变更，需要后端新增 chat_stream + 前端新增 WebSocket 接收",
+  "reason": "原来没有流式，现在新增，需要后端新增 chat_stream + 前端新增 WebSocket 接收",
   "backend_spec": {
     "name": "chat_api",
     "description": "对话 API，支持 chat / history / chat_stream（流式）"
@@ -271,20 +294,17 @@ export const FIX_DESIGN_USER_TEMPLATE = (
 
 修复需求：${issue}
 
-项目结构：
-- 后端：applications/${projectName}/
-${backendFilesDesc}
-- 前端：www/${projectName}/index.html（${frontendExists ? "存在" : "不存在"}）
-
-【后端文件摘要】
+【后端文件列表】
 ${backendFilesDesc}
 
-【后端完整源码】${sourceSection}
+【前端】
+- www/${projectName}/index.html（${frontendExists ? "存在" : "不存在"}）
+${sourceSection}
 
 请判断：
-1. mode（local / regenerate）
+1. mode（local / regenerate）—— 关键：是"新增协议"还是"修改已有"
 2. scope（backend / frontend / both）
-3. 具体改什么
+3. 具体改什么（涉及哪个文件，改哪个 action / 字段 / DOM）
 
 输出修复方案 JSON。只输出 JSON。`;
 };

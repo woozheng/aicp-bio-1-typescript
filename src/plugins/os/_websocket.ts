@@ -1,8 +1,11 @@
 /**
  * os/_websocket — WebSocket 网关插件
  *
- * 复用 HTTP 路由格式，共享 _auth 认证。
- * 与 Python 版 os/_websocket.py 对应。
+ * 与 Python 版 os/_websocket.py / Java 版 os/_websocket.java 对齐。
+ *
+ * 鉴权策略：
+ *   - 本地请求（127.0.0.1 / localhost / ::1）→ 跳过 auth
+ *   - 其他 → 检查 token（X-AICP-Token / Cookie / query token）
  */
 
 import { Envelop } from "../../core/Envelop.js";
@@ -12,11 +15,8 @@ import type { Agent } from "../../core/Agent.js";
 // 状态
 // ============================================================
 
-// channel_id → Set<ws>
 const _channels: Map<string, Set<any>> = new Map();
-// ws → Set<channel_id>
 const _wsToChannels: Map<any, Set<string>> = new Map();
-// ws → ws_id
 const _wsId: Map<any, string> = new Map();
 
 let server: any = null;
@@ -152,11 +152,30 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
         const url = new URL(request.url);
 
         if (url.pathname === "/ws") {
+          const channelId = url.searchParams.get("channel") ?? `default_${randomHex(6)}`;
+          const token = url.searchParams.get("token") ?? "";
+
+          // ★ 判断本地请求（对齐 Python）
+          const isLocal =
+            url.hostname === "127.0.0.1" ||
+            url.hostname === "localhost" ||
+            url.hostname === "::1";
+
+          // 非本地 → 检查 auth
+          if (!isLocal) {
+            const enableAuth = agent.config?.enable_auth ?? false;
+            const validTokens: string[] = agent.config?.tokens ?? [];
+
+            if (enableAuth && validTokens.length > 0 && !validTokens.includes(token)) {
+              agent.log?.warn?.(
+                `[WS] Reject (auth failed): host=${url.hostname} token=${token || "(empty)"}`
+              );
+              return new Response("Unauthorized", { status: 401 });
+            }
+          }
+
           const upgraded = server.upgrade(request, {
-            data: {
-              channelId: url.searchParams.get("channel") ?? `default_${randomHex(6)}`,
-              token: url.searchParams.get("token") ?? "",
-            },
+            data: { channelId, token, isLocal },
           });
           if (upgraded) return undefined;
           return new Response("WebSocket upgrade failed", { status: 400 });
@@ -171,20 +190,14 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 
       websocket: {
         open(ws: any) {
-          const { channelId, token } = ws.data;
-
-          // 认证（可选）
-          const enableAuth = agent.config?.enable_auth ?? false;
-          const validTokens = agent.config?.tokens ?? [];
-          if (enableAuth && validTokens.length > 0 && !validTokens.includes(token)) {
-            ws.close(4001, "Unauthorized");
-            return;
-          }
+          const { channelId, isLocal } = ws.data;
 
           register(ws, channelId);
           const wsId = _wsId.get(ws);
 
-          agent.log?.info?.(`[WS] Connected: ${wsId} → channel=${channelId}`);
+          agent.log?.info?.(
+            `[WS] Connected: ${wsId} → channel=${channelId}${isLocal ? " (local, skip auth)" : ""}`
+          );
 
           ws.send(JSON.stringify({
             type: "connected",

@@ -31,7 +31,9 @@ export const GENERATE_FRONTEND_SYSTEM = `你是前端工程师。你的唯一任
 
 ### 项目名
 
-var project = "__AICP_PROJECT__" || window.location.pathname.split('/')[1];
+### 项目名
+
+var project = window.location.pathname.split('/')[1];
 
 ### API 基址
 
@@ -51,15 +53,21 @@ async function request(payload) {
   });
   var rawText = await resp.text();
   if (!rawText) return { ok: false, error: '空响应' };
-  var json = JSON.parse(rawText);
-  var result = json.data || json;
-  result.ok = json.ok;  // ★ 必须保留 ok 字段
-  return result;
+  return JSON.parse(rawText);   // ★ 原样返回 { ok, data, error }
 }
 
-调用示例：
-var result = await request({ action: 'create_task', title: 'xxx' });
+调用示例（★ 必须用 result.data.xxx 取业务数据）：
+var result = await request({ action: 'list_tasks' });
 if (!result.ok) { alert('失败: ' + result.error); return; }
+var tasks = result.data.tasks || [];              // ★ 用 result.data.tasks
+var note = result.data.note;                      // ★ 用 result.data.note
+var attachments = result.data.attachments || [];  // ★ 用 result.data.attachments
+
+★ 铁律：
+- 后端固定返回 { ok, data, error }
+- 前端固定从 result.ok / result.data.xxx / result.error 取
+- 禁止解包（禁止 json.data || json）
+- 禁止写 result.xxx（业务数据都在 result.data 里）
 
 ### 字段对齐（最重要）
 
@@ -142,18 +150,42 @@ if (items.length === 0) {
 
 ### WebSocket（如需实时推送）
 
-用占位符 __WS_URL__，前端插件会自动替换：
+用 fetch('/api/ws_config') 动态拿 WS 地址，不要硬编码端口：
 
-var WS_URL = "__WS_URL__";
-var wsChannel = 'pa_' + getSessionId();
-var wsToken = getSessionId();
-var ws = new WebSocket(WS_URL + '?channel=' + wsChannel + '&token=' + encodeURIComponent(wsToken));
+var ws = null;
 
-ws.onmessage = function(e) {
-  var msg = JSON.parse(e.data);
-  var data = msg.data || msg;
-  // 处理推送
-};
+function getSessionId() {
+  var match = document.cookie.match(/aicp_token=([^;]+)/);
+  return match ? match[1] : 'default';
+}
+
+function connectWS() {
+  var sid = getSessionId();
+  var wsChannel = 'pa_' + sid;
+  fetch('/api/ws_config').then(function(r) { return r.json(); }).then(function(data) {
+    var url = data.url;   // 后端返回 ws://host:port/ws
+    if (!url) {
+      console.warn('[WS] ws_config 无 url');
+      return;
+    }
+    ws = new WebSocket(url + '?channel=' + encodeURIComponent(wsChannel) + '&token=' + encodeURIComponent(sid));
+    ws.onopen = function() {
+      console.log('[WS] connected');
+    };
+    ws.onmessage = function(e) {
+      var msg = JSON.parse(e.data);
+      var data = msg.data || msg;
+      // 处理推送
+    };
+    ws.onclose = function() {
+      ws = null;
+      setTimeout(connectWS, 3000);   // 3 秒后重连
+    };
+  }).catch(function(e) {
+    console.warn('[WS] connect failed:', e);
+  });
+}
+connectWS();
 
 ### ★ 流式接收规范（后端 help() 的 streaming 数组里有 action 时必须遵守）
 
@@ -179,34 +211,40 @@ function connectStreamWS() {
     }
     var sessionId = getSessionId();
     var wsChannel = 'pa_' + sessionId;    // ★ 用 sessionId，不是 project
-    var wsToken = sessionId;
-    ws = new WebSocket(WS_URL + '?channel=' + wsChannel + '&token=' + encodeURIComponent(wsToken));
 
-    ws.onmessage = function(e) {
-        var msg = JSON.parse(e.data);
-        if (msg.type !== 'summary_stream') return;   // 后端推的 type
+    fetch('/api/ws_config').then(function(r) { return r.json(); }).then(function(cfg) {
+        var wsUrl = cfg.url;   // 后端返回 ws://host:port/ws
+        if (!wsUrl) return;
+        ws = new WebSocket(wsUrl + '?channel=' + encodeURIComponent(wsChannel) + '&token=' + encodeURIComponent(sessionId));
 
-        var chunk = msg.chunk || '';
-        if (!chunk) return;
+        ws.onmessage = function(e) {
+            var msg = JSON.parse(e.data);
+            if (msg.type !== 'summary_stream') return;   // 后端推的 type
 
-        if (!streamBubble) {
-            var container = document.getElementById('chatMessages');
-            var div = document.createElement('div');
-            div.className = 'msg assistant';
-            div.innerHTML = '<div class="bubble" data-stream="summary">💭 </div>';
-            container.appendChild(div);
-            streamBubble = div.querySelector('.bubble');
-        }
+            var chunk = msg.chunk || '';
+            if (!chunk) return;
 
-        streamBubble.textContent += chunk;
+            if (!streamBubble) {
+                var container = document.getElementById('chatMessages');
+                var div = document.createElement('div');
+                div.className = 'msg assistant';
+                div.innerHTML = '<div class="bubble" data-stream="summary">💭 </div>';
+                container.appendChild(div);
+                streamBubble = div.querySelector('.bubble');
+            }
 
-        var msgs = document.getElementById('chatMessages');
-        if (msgs) msgs.scrollTop = msgs.scrollHeight;
-    };
+            streamBubble.textContent += chunk;
 
-    ws.onclose = function() {
-        ws = null;
-    };
+            var msgs = document.getElementById('chatMessages');
+            if (msgs) msgs.scrollTop = msgs.scrollHeight;
+        };
+
+        ws.onclose = function() {
+            ws = null;
+        };
+    }).catch(function(e) {
+        console.warn('[WS] connectStreamWS failed:', e);
+    });
 }
 
 #### 2. fetch 时传 meta.session_id
@@ -245,22 +283,36 @@ async function sendChat() {
 
 ### 文件上传（如需上传文件）
 
-用占位符 __UPLOAD_URL__，前端插件会自动替换：
+用 fetch('/api/upload_config') 动态拿上传地址：
 
-var UPLOAD_URL = "__UPLOAD_URL__";
-var formData = new FormData();
-formData.append('file', file);
-fetch(UPLOAD_URL, { method: 'POST', body: formData })
-  .then(function(r) { return r.json(); })
-  .then(function(data) { /* data.file_path, data.file_name */ });
+async function uploadFile(file) {
+  var cfg = await fetch('/api/upload_config').then(function(r) { return r.json(); });
+  var uploadUrl = cfg.url;
+  if (!uploadUrl) {
+    alert('上传服务不可用');
+    return;
+  }
 
-### 占位符约定
+  var formData = new FormData();
+  formData.append('file', file);
 
-- __AICP_PROJECT__：项目名
-- __WS_URL__：WebSocket 完整地址
-- __UPLOAD_URL__：文件上传完整地址
-- 禁止硬编码端口（9001 / 9002）或主机名
+  var resp = await fetch(uploadUrl, { method: 'POST', body: formData });
+  var data = await resp.json();
+  if (!data.success) {
+    alert('上传失败: ' + (data.error || '未知'));
+    return;
+  }
+  return data.file_path;   // 后续可传给后端记录
+}
+
+### URL 来源约定
+
+- 项目名：从 URL path 取：var project = window.location.pathname.split('/')[1];
+- WebSocket 地址：动态 fetch('/api/ws_config') 拿 cfg.url
+- 上传地址：动态 fetch('/api/upload_config') 拿 cfg.url
+- 禁止硬编码端口（9000 / 9001 / 9002）或主机名
 - 禁止用 location.port + 1 / + 2
+- 禁止用 __WS_URL__ / __UPLOAD_URL__ / __AICP_PROJECT__ 占位符
 
 ### CSS（严格禁止）
 
@@ -304,22 +356,26 @@ fetch(UPLOAD_URL, { method: 'POST', body: formData })
 9. ★ 流式页面必须建立 WebSocket 连接，接收 summary_stream 消息
 10. ★ 流式气泡全局唯一（streamBubble），不要每次 chunk 都新建
 11. ★ 流式 fetch 必须传 meta.session_id，否则后端推 pa_default，前端收不到
+12. ★ WS 地址用 fetch('/api/ws_config') 拿，不用占位符
+13. ★ 上传地址用 fetch('/api/upload_config') 拿，不用占位符
 
 ## 输出前自检
 
 □ 第一行 <!DOCTYPE html>，最后一行 </html>
-□ var project = "__AICP_PROJECT__" || window.location.pathname.split('/')[1]
+□ var project = window.location.pathname.split('/')[1]
 □ var API = '/api/applications/' + project
 □ var API_PLUGIN = "xxx"（用 user 消息里的实际值）
 □ 所有 API 调用走 request() 封装
-□ request() 保留 ok 字段
+□ request() 返回 { ok, data, error } 三个字段
+□ request() 内部没有用 json.data || json 解包
+□ 所有业务数据用 result.data.xxx 取（不是 result.xxx）
 □ 字段名与后端源码完全一致，无别名
 □ 创建 / 编辑 / 删除成功后刷新列表
 □ 无 const / let / 箭头函数 / 模板字符串
 □ 变量名避开浏览器全局
 □ DOM 清空用 while firstChild
-□ 如需 WS，用 __WS_URL__ 占位符，不硬编码端口
-□ 如需上传，用 __UPLOAD_URL__ 占位符，不硬编码端口
+□ 如需 WS，用 fetch('/api/ws_config') 拿地址，不硬编码端口
+□ 如需上传，用 fetch('/api/upload_config') 拿地址，不硬编码端口
 □ 数据使用前判空
 □ 列表空状态显示提示
 □ 无 gradient / box-shadow / backdrop-filter

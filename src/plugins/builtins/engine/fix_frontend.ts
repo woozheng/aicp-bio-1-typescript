@@ -22,7 +22,7 @@ export const FIX_FRONTEND_SYSTEM = `你是前端工程师。你的唯一任务�
 
 ### 项目名与 API
 
-var project = "__AICP_PROJECT__" || window.location.pathname.split('/')[1];
+var project = window.location.pathname.split('/')[1];
 var API = '/api/applications/' + project;
 var API_PLUGIN = "api";
 
@@ -74,6 +74,15 @@ async function request(payload) {
 ❌ 禁新增 gradient / box-shadow / backdrop-filter
 ❌ 禁新增过度动画
 ✅ 保持原有样式
+
+### URL 来源约定
+
+- 项目名：从 URL path 取：var project = window.location.pathname.split('/')[1];
+- WebSocket 地址：动态 fetch('/api/ws_config') 拿 cfg.url
+- 上传地址：动态 fetch('/api/upload_config') 拿 cfg.url
+- 禁止硬编码端口（9000 / 9001 / 9002）或主机名
+- 禁止用 location.port + 1 / + 2
+- 禁止用 __WS_URL__ / __UPLOAD_URL__ / __AICP_PROJECT__ 占位符
 
 ## 输出格式
 

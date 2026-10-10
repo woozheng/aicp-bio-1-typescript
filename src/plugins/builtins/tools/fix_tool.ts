@@ -1,8 +1,6 @@
 /**
  * fix_tool — 修复已有应用
  *
- * 统一 action 模式：action: "fix"（默认）
- *
  * 输入：target（项目名 / 路径）+ issue（修复需求，自然语言）
  *
  * 流程：
@@ -11,7 +9,7 @@
  *   3. fix_design → 修复方案（mode + scope + 具体文件 + 具体改动）
  *   4. 按 mode 分流：
  *      - local：走 fix_backend / fix_frontend（局部修）
- *      - regenerate：走 generate_backend / generate_frontend（带现有代码，保留旧功能）
+ *      - regenerate：走 generate_backend / generate_frontend（带现有代码）
  *   5. 原子写
  *   6. 等 watcher 重载
  *   7. 返回
@@ -55,6 +53,200 @@ const MAX_BACKEND_SOURCE_CHARS = 30000;
 const MAX_FILE_SUMMARY_CHARS = 2000;
 
 // ============================================================
+// WS 推送
+// ============================================================
+
+async function pushCode(agent: Agent, sessionId: string, chunk: string): Promise<void> {
+  try {
+    const env = new Envelop({
+      sender: "builtins/tools/fix_tool",
+      receiver: "os/_websocket",
+      payload: {
+        action: "push",
+        channel_id: "pa_" + sessionId,
+        data: {
+          type: "code_stream",
+          chunk: chunk,
+        },
+      },
+    });
+    await agent.system.call(env);
+  } catch {
+    // 推送失败不影响主流程
+  }
+}
+
+async function pushProgress(
+  agent: Agent,
+  sessionId: string,
+  step: string,
+  msg: string
+): Promise<void> {
+  try {
+    const env = new Envelop({
+      sender: "builtins/tools/fix_tool",
+      receiver: "os/_websocket",
+      payload: {
+        action: "push",
+        channel_id: "pa_" + sessionId,
+        data: {
+          type: "progress",
+          step: step,
+          msg: msg,
+          message: msg,
+        },
+      },
+    });
+    await agent.system.call(env);
+  } catch {
+    // 推送失败不影响主流程
+  }
+}
+
+// ============================================================
+// 流式 LLM 调用
+// ============================================================
+
+async function streamLLM(
+  agent: Agent,
+  messages: Array<{ role: string; content: string }>,
+  sessionId: string
+): Promise<string> {
+  if (!agent.llm) throw new Error("LLM 未配置");
+
+  let buffer = "";
+  for await (const delta of agent.llm.chat_stream(messages as any, undefined, "code")) {
+    if (delta) {
+      buffer += delta;
+      await pushCode(agent, sessionId, delta);
+    }
+  }
+  return buffer;
+}
+
+// ============================================================
+// HTML 续写
+// ============================================================
+
+async function continueHtml(
+  agent: Agent,
+  partialHtml: string,
+  sessionId: string,
+  maxContinuations: number = 3
+): Promise<string> {
+  if (!agent.llm) throw new Error("LLM 未配置");
+
+  let html = partialHtml;
+
+  for (let attempt = 0; attempt < maxContinuations; attempt++) {
+    const lower = html.trim().toLowerCase();
+
+    if (lower.endsWith("</html>")) {
+      return html;
+    }
+
+    if (lower.includes("</body>")) {
+      return html.trimEnd() + "\n</html>";
+    }
+
+    const prompt = `【HTML 被截断了，请从断点续写到 </html>】
+
+以下是**完整的已生成 HTML**（从头到断点）：
+
+\`\`\`html
+${html}
+\`\`\`
+
+【续写规则】
+1. 从断点（最后一行）继续写，不要重复已有内容
+2. **必须沿用上面已有的所有命名**：
+   - 函数名（如 formatDeadline、handleCoverUpload 等）
+   - 变量名（如 currentVoteId、selectedOptionIndex 等）
+   - HTML 元素 ID（如 voteGrid、detailView、optionsList 等）
+   - CSS 类名
+3. 如果上面的代码"引用了某个函数但还没定义"，你在这里定义它（用**相同的名字**）
+4. 如果上面的代码"引用了某个元素 ID 但 HTML 里没有"，你要在续写的 JS 里用**相同的 ID** 或说明该 ID 应在哪里
+5. 写完所有剩余内容后，依次闭合 \`</script>\`、\`</body>\`、\`</html>\`
+6. 直接输出续写内容，不要重复 <!DOCTYPE html>、<html>、<head>、<style> 等
+
+只输出从断点开始的续写内容（不要重复前面的代码）。`;
+
+    let continuation = "";
+    try {
+      for await (const delta of agent.llm.chat_stream(
+        [{ role: "user", content: prompt }] as any,
+        undefined,
+        "code"
+      )) {
+        if (delta) {
+          continuation += delta;
+          await pushCode(agent, sessionId, delta);
+        }
+      }
+    } catch (e) {
+      console.warn("[continueHtml] LLM call failed:", e);
+      return html;
+    }
+
+    if (!continuation) {
+      return html;
+    }
+
+    // 清理代码块标记
+    continuation = continuation.trim();
+    for (const prefix of ["```html", "```javascript", "```js", "```"]) {
+      if (continuation.startsWith(prefix)) {
+        continuation = continuation.slice(prefix.length);
+        break;
+      }
+    }
+    for (const suffix of ["```", "~~~"]) {
+      if (continuation.endsWith(suffix)) {
+        continuation = continuation.slice(0, -suffix.length);
+        break;
+      }
+    }
+    continuation = continuation.trim();
+
+    // 移除可能的 html_content = '''...''' 包裹
+    const m = continuation.match(/html_content\s*=\s*['"]{3}([\s\S]*?)['"]{3}/);
+    if (m) {
+      continuation = m[1].trim();
+    }
+
+    // ★★★ 关键：重叠检测 + 去重 ★★★
+    // 找"续写内容" 和 "前半段结尾" 的最长重叠
+    let overlapLen = 0;
+    const maxCheck = Math.min(html.length, continuation.length);
+    for (let i = maxCheck; i >= 8; i--) {   // 至少 8 字符才算"重叠"
+      const tail = html.slice(-i);
+      if (continuation.startsWith(tail)) {
+        overlapLen = i;
+        break;
+      }
+    }
+
+    if (overlapLen > 0) {
+      console.log(`[continueHtml] 检测到重叠 ${overlapLen} 字符，去重`);
+      continuation = continuation.slice(overlapLen);
+    }
+
+    html = html + continuation;
+
+    // ★ 修复"粘连"（`var optionsvar inputElements` 这种）
+    html = html.replace(/(var\s+\w+)\s*(var\s+\w+)/g, "$1;\n$2");
+    html = html.replace(/(if\s*\([^)]+\))\s*(if\s*\([^)]+\))/g, "$1;\n$2");
+    html = html.replace(/(function\s*\w*\s*\([^)]*\)\s*\{?)\s*(function\s*\w*\s*\()/g, "$1\n$2");
+
+    await pushProgress(
+      agent, sessionId, "executing",
+      `HTML 续写完成（第 ${attempt + 1} 次），当前 ${html.length} 字`
+    );
+  }
+
+  return html;
+}
+// ============================================================
 // 工具函数
 // ============================================================
 
@@ -72,8 +264,53 @@ function extractHtmlBlock(raw: string): string | null {
   return null;
 }
 
+async function extractHtmlWithContinuation(
+  agent: Agent,
+  raw: string,
+  sessionId: string
+): Promise<string> {
+  let html = extractHtmlBlock(raw);
+
+  if (!html) {
+    const looseMatch = raw.match(/(<!DOCTYPE html>[\s\S]*)$/i);
+    if (looseMatch) {
+      html = looseMatch[1];
+    } else {
+      throw new Error("无法提取 HTML 代码");
+    }
+  }
+
+  const lower = html.trim().toLowerCase();
+
+  if (!lower.includes("<!doctype")) {
+    throw new Error("HTML 缺少 <!DOCTYPE>");
+  }
+
+  if (lower.endsWith("</html>")) {
+    return html;
+  }
+
+  if (lower.includes("</body>")) {
+    return html.trimEnd() + "\n</html>";
+  }
+
+  await pushProgress(agent, sessionId, "executing", "HTML 被截断，正在续写...");
+  html = await continueHtml(agent, html, sessionId);
+
+  const finalLower = html.trim().toLowerCase();
+  if (!finalLower.endsWith("</html>")) {
+    if (finalLower.includes("</body>")) {
+      html = html.trimEnd() + "\n</html>";
+    } else {
+      throw new Error("HTML 续写后仍不完整");
+    }
+  }
+
+  return html;
+}
+
 // ============================================================
-// 项目解析（与原来相同）
+// 项目解析
 // ============================================================
 
 function parseProjectName(target: string): string {
@@ -235,11 +472,13 @@ async function callFixBackend(
   backendFileName: string,
   issue: string,
   currentCode: string,
-  backendChanges: any[]
+  backendChanges: any[],
+  sessionId: string
 ): Promise<string> {
   if (!agent.llm) throw new Error("LLM 未配置");
 
-  const raw = await agent.llm.chat(
+  const raw = await streamLLM(
+    agent,
     [
       { role: "system", content: FIX_BACKEND_SYSTEM },
       {
@@ -253,8 +492,7 @@ async function callFixBackend(
         ),
       },
     ],
-    undefined,
-    "code"
+    sessionId
   );
 
   const code = extractPluginBlock(raw);
@@ -268,11 +506,13 @@ async function callFixFrontend(
   issue: string,
   currentHtml: string,
   backendSource: string,
-  frontendChanges: any[]
+  frontendChanges: any[],
+  sessionId: string
 ): Promise<string> {
   if (!agent.llm) throw new Error("LLM 未配置");
 
-  const raw = await agent.llm.chat(
+  const raw = await streamLLM(
+    agent,
     [
       { role: "system", content: FIX_FRONTEND_SYSTEM },
       {
@@ -286,12 +526,11 @@ async function callFixFrontend(
         ),
       },
     ],
-    undefined,
-    "code"
+    sessionId
   );
 
-  const html = extractHtmlBlock(raw);
-  if (!html) throw new Error("无法提取 HTML 代码");
+  // ★ 提取 + 续写
+  const html = await extractHtmlWithContinuation(agent, raw, sessionId);
   return html;
 }
 
@@ -300,11 +539,13 @@ async function callGenerateBackend(
   projectName: string,
   pluginSpec: any,
   issue: string,
-  currentCode: string
+  currentCode: string,
+  sessionId: string
 ): Promise<string> {
   if (!agent.llm) throw new Error("LLM 未配置");
 
-  const raw = await agent.llm.chat(
+  const raw = await streamLLM(
+    agent,
     [
       { role: "system", content: GENERATE_BACKEND_SYSTEM },
       {
@@ -317,8 +558,7 @@ async function callGenerateBackend(
         ),
       },
     ],
-    undefined,
-    "code"
+    sessionId
   );
 
   const code = extractPluginBlock(raw);
@@ -333,11 +573,13 @@ async function callGenerateFrontend(
   issue: string,
   backendSource: string,
   apiPlugin: string,
-  currentHtml: string
+  currentHtml: string,
+  sessionId: string
 ): Promise<string> {
   if (!agent.llm) throw new Error("LLM 未配置");
 
-  const raw = await agent.llm.chat(
+  const raw = await streamLLM(
+    agent,
     [
       { role: "system", content: GENERATE_FRONTEND_SYSTEM },
       {
@@ -352,12 +594,11 @@ async function callGenerateFrontend(
         ),
       },
     ],
-    undefined,
-    "code"
+    sessionId
   );
 
-  const html = extractHtmlBlock(raw);
-  if (!html) throw new Error("无法提取 HTML 代码");
+  // ★ 提取 + 续写
+  const html = await extractHtmlWithContinuation(agent, raw, sessionId);
   return html;
 }
 
@@ -395,6 +636,9 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     envelop.payload = { ok: false, error: "LLM 未配置" };
     return envelop;
   }
+
+  // ★ sessionId（用于 WS 推送）
+  const sessionId = (envelop.meta?.session_id as string) ?? "default";
 
   const projectName = parseProjectName(target);
   if (!projectName) {
@@ -438,6 +682,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
   // 1. fix_design
   // ============================================================
 
+  await pushProgress(agent, sessionId, "executing", "分析问题，设计修复方案...");
+
   let design: any;
   try {
     design = await callFixDesign(
@@ -459,6 +705,13 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
   const backendChanges = design.backend_changes ?? [];
   const frontendChanges = design.frontend_changes ?? [];
 
+  await pushProgress(
+    agent,
+    sessionId,
+    "done",
+    `修复方案：${mode} / ${scope}`
+  );
+
   const writtenFiles: string[] = [];
 
   // ============================================================
@@ -470,7 +723,6 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     // 2A. 重生成：走 generate_*（带现有代码）
     // ============================================================
 
-    // ---- 后端 ----
     if ((scope === "backend" || scope === "both") && backendExists) {
       for (const file of backendFiles) {
         const currentCode = await readFile(file.path, "utf-8");
@@ -480,6 +732,13 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
           description: issue,
         };
 
+        await pushProgress(
+          agent,
+          sessionId,
+          "executing",
+          `重生成后端 ${file.fileName}...`
+        );
+
         let newCode: string;
         try {
           newCode = await callGenerateBackend(
@@ -487,7 +746,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
             projectName,
             spec,
             issue,
-            currentCode
+            currentCode,
+            sessionId
           );
         } catch (e: any) {
           envelop.payload = {
@@ -499,10 +759,16 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 
         const actualPath = await atomicWrite(file.path, newCode, projectName);
         writtenFiles.push(actualPath);
+
+        await pushProgress(
+          agent,
+          sessionId,
+          "done",
+          `${file.fileName} 重生成完成（${newCode.length} 字）`
+        );
       }
     }
 
-    // ---- 前端 ----
     if ((scope === "frontend" || scope === "both") && frontendExists) {
       const freshBackendSource = await collectBackendSource(projectName);
 
@@ -511,8 +777,9 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
         description: issue,
       };
 
-      // 推断 API plugin 名（取第一个后端文件名）
       const apiPlugin = backendFiles[0]?.fileName.replace(".ts", "") ?? "";
+
+      await pushProgress(agent, sessionId, "executing", "重生成前端页面...");
 
       let newHtml: string;
       try {
@@ -523,7 +790,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
           issue,
           freshBackendSource,
           apiPlugin,
-          currentHtml
+          currentHtml,
+          sessionId
         );
       } catch (e: any) {
         envelop.payload = {
@@ -535,13 +803,14 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 
       const actualPath = await atomicWrite(htmlPath, newHtml, projectName);
       writtenFiles.push(actualPath);
+
+      await pushProgress(agent, sessionId, "done", "前端页面重生成完成");
     }
   } else {
     // ============================================================
-    // 2B. 局部改：走 fix_*（原逻辑）
+    // 2B. 局部改：走 fix_*
     // ============================================================
 
-    // ---- 后端 ----
     if ((scope === "backend" || scope === "both") && backendExists) {
       for (const change of backendChanges) {
         const fileName = change.file;
@@ -549,6 +818,14 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
           if (backendFiles.length === 0) continue;
           const fallback = backendFiles[0];
           const currentCode = await readFile(fallback.path, "utf-8");
+
+          await pushProgress(
+            agent,
+            sessionId,
+            "executing",
+            `修复后端 ${fallback.fileName}...`
+          );
+
           let newCode: string;
           try {
             newCode = await callFixBackend(
@@ -557,7 +834,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
               fallback.fileName,
               issue,
               currentCode,
-              [change]
+              [change],
+              sessionId
             );
           } catch (e: any) {
             envelop.payload = {
@@ -568,6 +846,13 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
           }
           const actualPath = await atomicWrite(fallback.path, newCode, projectName);
           writtenFiles.push(actualPath);
+
+          await pushProgress(
+            agent,
+            sessionId,
+            "done",
+            `${fallback.fileName} 修复完成`
+          );
           continue;
         }
 
@@ -580,6 +865,14 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
           return envelop;
         }
         const currentCode = await readFile(filePath, "utf-8");
+
+        await pushProgress(
+          agent,
+          sessionId,
+          "executing",
+          `修复后端 ${fileName}...`
+        );
+
         let newCode: string;
         try {
           newCode = await callFixBackend(
@@ -588,7 +881,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
             fileName,
             issue,
             currentCode,
-            [change]
+            [change],
+            sessionId
           );
         } catch (e: any) {
           envelop.payload = {
@@ -599,15 +893,18 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
         }
         const actualPath = await atomicWrite(filePath, newCode, projectName);
         writtenFiles.push(actualPath);
+
+        await pushProgress(agent, sessionId, "done", `${fileName} 修复完成`);
       }
     }
 
-    // ---- 前端 ----
     if ((scope === "frontend" || scope === "both") && frontendExists) {
       const useBackendSource =
         scope === "both"
           ? await collectBackendSource(projectName)
           : backendSource;
+
+      await pushProgress(agent, sessionId, "executing", "修复前端页面...");
 
       let newHtml: string;
       try {
@@ -617,7 +914,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
           issue,
           currentHtml,
           useBackendSource,
-          frontendChanges
+          frontendChanges,
+          sessionId
         );
       } catch (e: any) {
         envelop.payload = { ok: false, error: `修复前端失败: ${e.message}` };
@@ -627,6 +925,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       try {
         const actualPath = await atomicWrite(htmlPath, newHtml, projectName);
         writtenFiles.push(actualPath);
+        await pushProgress(agent, sessionId, "done", "前端页面修复完成");
       } catch (e: any) {
         envelop.payload = { ok: false, error: `写入前端失败: ${e.message}` };
         return envelop;
@@ -637,6 +936,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
   // ============================================================
   // 3. 等 watcher 重载
   // ============================================================
+
+  await pushProgress(agent, sessionId, "executing", "等待热加载编译...");
 
   await new Promise((r) => setTimeout(r, 3000));
 

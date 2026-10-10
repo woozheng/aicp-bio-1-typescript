@@ -1,18 +1,14 @@
 /**
  * create_tool — 创建新应用（一把梭）
  *
- * 统一 action 模式：action: "create"（默认）
- *
- * 输入：name（英文项目名）+ description（自然语言需求）
- *
  * 流程：
- *   1. design → 架构 JSON
- *   2. 逐个 generate_backend → TS 代码
+ *   1. design → 架构 JSON（同步）
+ *   2. 逐个 generate_backend → TS 代码（流式，每 chunk 推 WS）
  *   3. 收集后端源码（传给前端对齐字段）
- *   4. generate_frontend → HTML
- *   5. 生成前端插件 www/{名}.ts（模板化）
- *   6. 原子写所有文件
- *   7. 等 3 秒，查 plugins Map 验证
+ *   4. generate_frontend → HTML（流式 + 续写）
+ *   5. 原子写所有文件
+ *   6. 等 watcher 加载
+ *   7. 查 plugins Map 验证
  */
 
 import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
@@ -38,10 +34,203 @@ import {
 // ============================================================
 
 const PROJECTS_DIR = "src/plugins/applications";
-const WWW_PLUGINS_DIR = "src/plugins/www";
 const WWW_HTML_DIR = "www";
 const MAX_BACKEND_SOURCE_CHARS = 30000;
 
+// ============================================================
+// WS 推送
+// ============================================================
+
+async function pushCode(agent: Agent, sessionId: string, chunk: string): Promise<void> {
+  try {
+    const env = new Envelop({
+      sender: "builtins/tools/create_tool",
+      receiver: "os/_websocket",
+      payload: {
+        action: "push",
+        channel_id: "pa_" + sessionId,
+        data: {
+          type: "code_stream",
+          chunk: chunk,
+        },
+      },
+    });
+    await agent.system.call(env);
+  } catch {
+    // 推送失败不影响主流程
+  }
+}
+
+async function pushProgress(
+  agent: Agent,
+  sessionId: string,
+  step: string,
+  msg: string
+): Promise<void> {
+  try {
+    const env = new Envelop({
+      sender: "builtins/tools/create_tool",
+      receiver: "os/_websocket",
+      payload: {
+        action: "push",
+        channel_id: "pa_" + sessionId,
+        data: {
+          type: "progress",
+          step: step,
+          msg: msg,
+          message: msg,
+        },
+      },
+    });
+    await agent.system.call(env);
+  } catch {
+    // 推送失败不影响主流程
+  }
+}
+
+// ============================================================
+// 流式 LLM 调用
+// ============================================================
+
+async function streamLLM(
+  agent: Agent,
+  messages: Array<{ role: string; content: string }>,
+  sessionId: string
+): Promise<string> {
+  if (!agent.llm) throw new Error("LLM 未配置");
+
+  let buffer = "";
+  for await (const delta of agent.llm.chat_stream(messages as any, undefined, "code")) {
+    if (delta) {
+      buffer += delta;
+      await pushCode(agent, sessionId, delta);
+    }
+  }
+  return buffer;
+}
+
+// ============================================================
+// HTML 续写
+// ============================================================
+
+async function continueHtml(
+  agent: Agent,
+  partialHtml: string,
+  sessionId: string,
+  maxContinuations: number = 3
+): Promise<string> {
+  if (!agent.llm) throw new Error("LLM 未配置");
+
+  let html = partialHtml;
+
+  for (let attempt = 0; attempt < maxContinuations; attempt++) {
+    const lower = html.trim().toLowerCase();
+
+    if (lower.endsWith("</html>")) {
+      return html;
+    }
+
+    if (lower.includes("</body>")) {
+      return html.trimEnd() + "\n</html>";
+    }
+
+    const prompt = `【HTML 被截断了，请从断点续写到 </html>】
+
+以下是**完整的已生成 HTML**（从头到断点）：
+
+\`\`\`html
+${html}
+\`\`\`
+
+【续写规则】
+1. 从断点（最后一行）继续写，不要重复已有内容
+2. **必须沿用上面已有的所有命名**：
+   - 函数名（如 formatDeadline、handleCoverUpload 等）
+   - 变量名（如 currentVoteId、selectedOptionIndex 等）
+   - HTML 元素 ID（如 voteGrid、detailView、optionsList 等）
+   - CSS 类名
+3. 如果上面的代码"引用了某个函数但还没定义"，你在这里定义它（用**相同的名字**）
+4. 如果上面的代码"引用了某个元素 ID 但 HTML 里没有"，你要在续写的 JS 里用**相同的 ID** 或说明该 ID 应在哪里
+5. 写完所有剩余内容后，依次闭合 \`</script>\`、\`</body>\`、\`</html>\`
+6. 直接输出续写内容，不要重复 <!DOCTYPE html>、<html>、<head>、<style> 等
+
+只输出从断点开始的续写内容（不要重复前面的代码）。`;
+
+    let continuation = "";
+    try {
+      for await (const delta of agent.llm.chat_stream(
+        [{ role: "user", content: prompt }] as any,
+        undefined,
+        "code"
+      )) {
+        if (delta) {
+          continuation += delta;
+          await pushCode(agent, sessionId, delta);
+        }
+      }
+    } catch (e) {
+      console.warn("[continueHtml] LLM call failed:", e);
+      return html;
+    }
+
+    if (!continuation) {
+      return html;
+    }
+
+    // 清理代码块标记
+    continuation = continuation.trim();
+    for (const prefix of ["```html", "```javascript", "```js", "```"]) {
+      if (continuation.startsWith(prefix)) {
+        continuation = continuation.slice(prefix.length);
+        break;
+      }
+    }
+    for (const suffix of ["```", "~~~"]) {
+      if (continuation.endsWith(suffix)) {
+        continuation = continuation.slice(0, -suffix.length);
+        break;
+      }
+    }
+    continuation = continuation.trim();
+
+    // 移除可能的 html_content = '''...''' 包裹
+    const m = continuation.match(/html_content\s*=\s*['"]{3}([\s\S]*?)['"]{3}/);
+    if (m) {
+      continuation = m[1].trim();
+    }
+
+    // ★★★ 关键：重叠检测 + 去重 ★★★
+    // 找"续写内容" 和 "前半段结尾" 的最长重叠
+    let overlapLen = 0;
+    const maxCheck = Math.min(html.length, continuation.length);
+    for (let i = maxCheck; i >= 8; i--) {   // 至少 8 字符才算"重叠"
+      const tail = html.slice(-i);
+      if (continuation.startsWith(tail)) {
+        overlapLen = i;
+        break;
+      }
+    }
+
+    if (overlapLen > 0) {
+      console.log(`[continueHtml] 检测到重叠 ${overlapLen} 字符，去重`);
+      continuation = continuation.slice(overlapLen);
+    }
+
+    html = html + continuation;
+
+    // ★ 修复"粘连"（`var optionsvar inputElements` 这种）
+    html = html.replace(/(var\s+\w+)\s*(var\s+\w+)/g, "$1;\n$2");
+    html = html.replace(/(if\s*\([^)]+\))\s*(if\s*\([^)]+\))/g, "$1;\n$2");
+    html = html.replace(/(function\s*\w*\s*\([^)]*\)\s*\{?)\s*(function\s*\w*\s*\()/g, "$1\n$2");
+
+    await pushProgress(
+      agent, sessionId, "executing",
+      `HTML 续写完成（第 ${attempt + 1} 次），当前 ${html.length} 字`
+    );
+  }
+
+  return html;
+}
 // ============================================================
 // 工具函数
 // ============================================================
@@ -60,12 +249,6 @@ function extractPluginBlock(raw: string, pluginName: string): string | null {
   return null;
 }
 
-function postProcessHtml(html: string): string {
-  html = html.replace(/wss?:\/\/[^"'\s]+\/ws[^"'\s]*/g, "__WS_URL__");
-  html = html.replace(/https?:\/\/[^"'\s]+\/upload/g, "__UPLOAD_URL__");
-  return html;
-}
-
 function extractHtmlBlock(raw: string): string | null {
   const m = raw.match(/=== HTML:\s*[^=]+===\s*\n([\s\S]*?)=== END ===/);
   if (m) return m[1].trim();
@@ -76,113 +259,58 @@ function extractHtmlBlock(raw: string): string | null {
   return null;
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+async function extractHtmlWithContinuation(
+  agent: Agent,
+  raw: string,
+  sessionId: string
+): Promise<string> {
+  // 1. 标准提取
+  let html = extractHtmlBlock(raw);
 
-function makeFrontendPlugin(projectName: string): string {
-  return `/**
- * www/${projectName} — 前端节点
- *
- * render: 返回 index.html（前台主页）
- * asset:  返回其他页面（admin.html 等）和静态资源（css/js/图片）
- *
- * ⚠️ 关键：asset 对 .html / .htm 也要替换占位符。
- */
-
-import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import type { Envelop } from "../../core/Envelop.js";
-import type { Agent } from "../../core/Agent.js";
-
-const PROJECT_NAME = "${projectName}";
-const WWW_DIR = "www";
-
-function contentTypeOf(ext: string): string {
-  switch (ext) {
-    case "html":
-    case "htm":
-      return "text/html; charset=utf-8";
-    case "css":
-      return "text/css; charset=utf-8";
-    case "js":
-      return "application/javascript; charset=utf-8";
-    case "png":
-      return "image/png";
-    case "jpg":
-    case "jpeg":
-      return "image/jpeg";
-    case "svg":
-      return "image/svg+xml";
-    case "json":
-      return "application/json; charset=utf-8";
-    default:
-      return "application/octet-stream";
+  // 2. 宽松提取
+  if (!html) {
+    const looseMatch = raw.match(/(<!DOCTYPE html>[\s\S]*)$/i);
+    if (looseMatch) {
+      html = looseMatch[1];
+    } else {
+      throw new Error("无法提取 HTML 代码");
+    }
   }
-}
 
-function injectPlaceholders(html: string, agent: Agent): string {
-  const wsUrl = agent.config?.websocket?.external_url ?? "ws://127.0.0.1:9001/ws";
-  const uploadUrl = agent.config?.upload?.external_url ?? "http://127.0.0.1:9002/upload";
-  html = html.replace(/__AICP_PROJECT__/g, PROJECT_NAME);
-  html = html.replace(/__WS_URL__/g, wsUrl);
-  html = html.replace(/__UPLOAD_URL__/g, uploadUrl);
+  // 3. 检查完整性
+  const lower = html.trim().toLowerCase();
+
+  if (!lower.includes("<!doctype")) {
+    throw new Error("HTML 缺少 <!DOCTYPE>");
+  }
+
+  if (lower.endsWith("</html>")) {
+    return html; // 完整
+  }
+
+  if (lower.includes("</body>")) {
+    return html.trimEnd() + "\n</html>"; // 只补 </html>
+  }
+
+  // 4. 截断 → 续写
+  await pushProgress(agent, sessionId, "executing", "HTML 被截断，正在续写...");
+  html = await continueHtml(agent, html, sessionId);
+
+  // 5. 最终检查
+  const finalLower = html.trim().toLowerCase();
+  if (!finalLower.endsWith("</html>")) {
+    if (finalLower.includes("</body>")) {
+      html = html.trimEnd() + "\n</html>";
+    } else {
+      throw new Error("HTML 续写后仍不完整");
+    }
+  }
+
   return html;
 }
 
-export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> {
-  const action = envelop.payload?.action ?? "render";
-
-  if (action === "render") {
-    const htmlPath = join(WWW_DIR, PROJECT_NAME, "index.html");
-    if (!existsSync(htmlPath)) {
-      envelop.payload = { ok: false, error: \`HTML 不存在: \${htmlPath}\` };
-      return envelop;
-    }
-    let html = await readFile(htmlPath, "utf-8");
-    html = injectPlaceholders(html, agent);
-    if (html.includes("__AICP_PROJECT__") || html.includes("__WS_URL__") || html.includes("__UPLOAD_URL__")) {
-      envelop.payload = { ok: false, error: "占位符替换失败" };
-      return envelop;
-    }
-    envelop.payload = { ok: true, content_type: "text/html; charset=utf-8", body: html };
-    return envelop;
-  }
-
-  if (action === "asset") {
-    const assetPath = envelop.payload?.path ?? "";
-    const safePath = assetPath.replace(/\\.\\./g, "");
-    const fullPath = join(WWW_DIR, PROJECT_NAME, safePath);
-    if (!existsSync(fullPath)) {
-      envelop.payload = { ok: false, error: \`资源不存在: \${fullPath}\` };
-      return envelop;
-    }
-    const ext = fullPath.split(".").pop()?.toLowerCase() ?? "";
-    if (ext === "html" || ext === "htm") {
-      let html = await readFile(fullPath, "utf-8");
-      html = injectPlaceholders(html, agent);
-      envelop.payload = { ok: true, content_type: "text/html; charset=utf-8", body: html };
-      return envelop;
-    }
-    const body = await readFile(fullPath);
-    envelop.payload = { ok: true, content_type: contentTypeOf(ext), body };
-    return envelop;
-  }
-
-  envelop.payload = { ok: false, error: \`未知 action: \${action}\` };
-  return envelop;
-}
-
-export function help() {
-  return {
-    route: "www/${projectName}",
-    description: "${projectName} 前端节点",
-    input: { action: "render | asset", path: "asset 时用" },
-    output: { ok: "是否成功", content_type: "MIME", body: "内容" },
-  };
-}
-`;
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ============================================================
@@ -210,11 +338,13 @@ async function callGenerateBackend(
   agent: Agent,
   document: any,
   pluginSpec: any,
-  projectName: string
+  projectName: string,
+  sessionId: string
 ): Promise<string> {
   if (!agent.llm) throw new Error("LLM 未配置");
 
-  const raw = await agent.llm.chat(
+  const raw = await streamLLM(
+    agent,
     [
       { role: "system", content: GENERATE_BACKEND_SYSTEM },
       {
@@ -222,8 +352,7 @@ async function callGenerateBackend(
         content: GENERATE_BACKEND_USER_TEMPLATE(document, pluginSpec, projectName),
       },
     ],
-    undefined,
-    "code"
+    sessionId
   );
 
   const code = extractPluginBlock(raw, pluginSpec.name);
@@ -237,11 +366,13 @@ async function callGenerateFrontend(
   frontendSpec: any,
   backendSource: string,
   projectName: string,
-  apiPlugin: string
+  apiPlugin: string,
+  sessionId: string
 ): Promise<string> {
   if (!agent.llm) throw new Error("LLM 未配置");
 
-  const raw = await agent.llm.chat(
+  const raw = await streamLLM(
+    agent,
     [
       { role: "system", content: GENERATE_FRONTEND_SYSTEM },
       {
@@ -255,12 +386,11 @@ async function callGenerateFrontend(
         ),
       },
     ],
-    undefined,
-    "code"
+    sessionId
   );
 
-  const html = extractHtmlBlock(raw);
-  if (!html) throw new Error("无法提取 HTML 代码");
+  // ★ 提取 + 续写
+  const html = await extractHtmlWithContinuation(agent, raw, sessionId);
   return html;
 }
 
@@ -302,9 +432,14 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     return envelop;
   }
 
+  // ★ sessionId（用于 WS 推送）
+  const sessionId = (envelop.meta?.session_id as string) ?? "default";
+
   // ============================================================
   // 1. design
   // ============================================================
+
+  await pushProgress(agent, sessionId, "executing", "分析需求，设计架构...");
 
   let design: any;
   try {
@@ -324,6 +459,13 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     pluginsSpec[0]?.name?.replace(/\.ts$/, "") ??
     "";
 
+  await pushProgress(
+    agent,
+    sessionId,
+    "done",
+    `架构设计完成：${projectName}（${pluginsSpec.length} 个插件${hasFrontend ? "，需要前端" : ""}）`
+  );
+
   // ============================================================
   // 2. 生成后端
   // ============================================================
@@ -332,14 +474,34 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
   const apiReceivers: string[] = [];
   const backendSources: Array<{ name: string; code: string }> = [];
 
+  let pluginIdx = 0;
+  const pluginTotal = pluginsSpec.length;
+
   for (const pluginSpec of pluginsSpec) {
+    pluginIdx++;
     const fileName = pluginSpec.name;
     const finalPath = join(PROJECTS_DIR, projectName, fileName);
     const receiver = `applications/${projectName}/${fileName.replace(/\.ts$/, "")}`;
 
+    await pushProgress(
+      agent,
+      sessionId,
+      "executing",
+      `生成 ${fileName}（${pluginIdx}/${pluginTotal}）...`
+    );
+
+    // 推分隔头
+    await pushCode(
+      agent,
+      sessionId,
+      `\n\n// ══════════════════════════════════════════\n` +
+        `// ${fileName}（${pluginIdx}/${pluginTotal}）\n` +
+        `// ══════════════════════════════════════════\n\n`
+    );
+
     let code: string;
     try {
-      code = await callGenerateBackend(agent, document, pluginSpec, projectName);
+      code = await callGenerateBackend(agent, document, pluginSpec, projectName, sessionId);
     } catch (e: any) {
       envelop.payload = {
         ok: false,
@@ -360,6 +522,13 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       };
       return envelop;
     }
+
+    await pushProgress(
+      agent,
+      sessionId,
+      "done",
+      `${fileName} 写入完成（${code.length} 字）`
+    );
   }
 
   // ============================================================
@@ -374,11 +543,10 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     }
     backendSourceContext = parts.join("\n\n");
 
-    // 超长截断（防止 token 爆）
     if (backendSourceContext.length > MAX_BACKEND_SOURCE_CHARS) {
       backendSourceContext =
         backendSourceContext.slice(0, MAX_BACKEND_SOURCE_CHARS) +
-        "\n\n... (后端源码过长，已截断，前端按已展示部分对齐字段)";
+        "\n\n... (后端源码过长，已截断)";
     }
   }
 
@@ -387,6 +555,8 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
   // ============================================================
 
   if (hasFrontend && frontendSpec) {
+    await pushProgress(agent, sessionId, "executing", "生成前端页面...");
+
     let html: string;
     try {
       html = await callGenerateFrontend(
@@ -395,9 +565,9 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
         frontendSpec,
         backendSourceContext,
         projectName,
-        apiPlugin
+        apiPlugin,
+        sessionId
       );
-      html = postProcessHtml(html);
     } catch (e: any) {
       envelop.payload = {
         ok: false,
@@ -423,30 +593,18 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
       return envelop;
     }
 
-    try {
-      const fePluginCode = makeFrontendPlugin(projectName);
-      const fePluginPath = join(WWW_PLUGINS_DIR, `${projectName}.ts`);
-      const actualPath = await atomicWrite(fePluginPath, fePluginCode);
-      writtenFiles.push(actualPath);
-    } catch (e: any) {
-      envelop.payload = {
-        ok: false,
-        error: `写入前端插件失败: ${e.message}`,
-      };
-      return envelop;
-    }
+    await pushProgress(agent, sessionId, "done", "前端页面生成完成");
   }
 
   // ============================================================
   // 5. 等 watcher 加载
   // ============================================================
 
+  await pushProgress(agent, sessionId, "executing", "等待热加载编译...");
+
   await new Promise((r) => setTimeout(r, 3000));
 
-  const receiversToCheck = [
-    ...apiReceivers,
-    ...(hasFrontend ? [`www/${projectName}`] : []),
-  ];
+  const receiversToCheck = [...apiReceivers];
   const loadedReceivers = receiversToCheck.filter((r) => plugins.has(r));
   const allLoaded = loadedReceivers.length === receiversToCheck.length;
 

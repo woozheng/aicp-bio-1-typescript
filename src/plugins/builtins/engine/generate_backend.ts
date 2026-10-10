@@ -92,6 +92,169 @@ const result = await agent.system.call(new Envelop({
 禁止：
 ❌ import type { Envelop } 后用 new
 ❌ new (Envelop as any)(...) —— as any 绕不过 new 的类型检查
+## ★ 跨插件约定（所有插件必须遵守）
+
+### 存储路径（统一）
+
+所有插件共享数据时，必须用同一套路径：
+
+- 应用数据根：{agent.data_dir}/{PROJECT}/
+- 主数据文件：{agent.data_dir}/{PROJECT}/data.json
+- 附件元数据：{agent.data_dir}/{PROJECT}/attachments.json
+- 附件实际文件：{agent.data_dir}/{PROJECT}/attachments/{attachment_id}
+- 禁止每个插件自己发明路径
+- 禁止用 {PROJECT}/notes/{id}/attachments.json 这类"子目录 + 同名文件"的嵌套路径
+
+### 调 os/_websocket 的 action（只有这两个合法）
+
+按频道推送（推荐，前端订阅什么频道就推什么）：
+await agent.system.call(new Envelop({
+  sender: envelop.receiver,
+  receiver: "os/_websocket",
+  payload: {
+    action: "push",
+    channel_id: "具体频道名",
+    data: { type: "消息类型", ...业务数据 },
+  },
+}));
+
+全服广播（所有连接都收到，不带 channel_id 语义）：
+await agent.system.call(new Envelop({
+  sender: envelop.receiver,
+  receiver: "os/_websocket",
+  payload: {
+    action: "broadcast",
+    data: { type: "消息类型", ...业务数据 },
+  },
+}));
+
+禁止用其他 action 名：
+❌ send / notify / emit / publish / post / dispatch
+
+### 频道命名
+
+- 前端订阅什么 channel，后端就推什么 channel
+- 频道名必须前后端完全一致
+- 常用格式：{应用名}_{业务id}_{session_id}
+- 禁止前后端各起一个名字
+
+### 调其他 applications 插件
+
+- receiver 格式：applications/{PROJECT}/{插件名}（不带 .ts）
+- 必须用 new Envelop 构造
+- payload 用 { action, ... } 格式
+- 调之前确认目标插件的 action 名和字段名（如果看不到目标插件代码，优先用同一应用内已定义的 action）
+
+## ★ 网关能力（必须遵守）
+
+TS 版网关**只支持**以下端点：
+
+- \`POST /api/applications/{project}/{plugin}\` —— 插件业务（网关的 handleApi 转发）
+- \`GET /api/ws_config\` —— WebSocket 配置
+- \`GET /api/upload_config\` —— 上传配置
+- \`GET /{path}\` —— 静态文件（www/ 目录）
+
+**网关不支持**：
+
+- ❌ 插件"自定义 HTTP 路由"
+- ❌ 插件"声明 http_routes"
+- ❌ 插件"注册 GET / POST 路由"
+- ❌ 插件"启动 HTTP 服务"（Bun.serve / http.createServer）
+
+**禁止在插件里**：
+
+\`\`\`typescript
+// ❌ 禁止：网关不会读这个导出
+export const http_routes = [
+  { method: "GET", path: "/api/xxx/cover/:id", handler: ... }
+];
+
+// ❌ 禁止：网关已提供 HTTP 服务
+Bun.serve({ ... });
+\`\`\`
+
+**插件只能**：
+
+\`\`\`typescript
+// ✅ 正确：只导出 execute 和 help
+export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> {
+  const action = envelop.payload?.action ?? "xxx";
+  // ...
+  envelop.payload = { ok: true, data: { ... } };
+  return envelop;
+}
+
+export function help() {
+  return { route: "...", ... };
+}
+\`\`\`
+
+## ★ 图片 / 文件访问（重要）
+
+需要"让前端显示图片"时，**用 base64 data_url**（不用 HTTP URL）。
+
+### 为什么
+
+TS 网关**不支持"插件自定义路由"**。图片走 base64 是"最稳"的方式。
+
+### 上传图片：返回 data_url
+
+\`\`\`typescript
+if (action === "upload_cover") {
+  const cover = params.cover;   // base64 字符串（可能带 data:image/png;base64, 前缀）
+  if (!cover) {
+    envelop.payload = { ok: false, error: "缺少 cover 参数" };
+    return envelop;
+  }
+
+  // 提取 base64 数据
+  let base64Data = cover;
+  let mime = "image/png";
+  if (cover.startsWith("data:")) {
+    const match = cover.match(/^data:([^;]+);base64,(.+)$/);
+    if (match) {
+      mime = match[1];
+      base64Data = match[2];
+    }
+  }
+
+  // 存到磁盘（可选，便于持久化 / 恢复）
+  const coverId = randomUUID();
+  const coverDir = join(agent.data_dir, PROJECT, "covers");
+  await mkdir(coverDir, { recursive: true });
+  const buffer = Buffer.from(base64Data, "base64");
+  await writeFile(join(coverDir, coverId), buffer);
+
+  // ★ 返回 data_url，不是 HTTP URL
+  const dataUrl = \`data:\${mime};base64,\${base64Data}\`;
+  envelop.payload = { ok: true, data: { cover_url: dataUrl, cover_id: coverId } };
+  return envelop;
+}
+\`\`\`
+
+### 查询投票：返回 base64
+
+\`\`\`typescript
+// 在 build_vote_info / build_vote_detail 里
+// 把"磁盘路径"或"base64"统一转成 data_url
+function coverToDataUrl(cover: string): string {
+  if (!cover) return "";
+  if (cover.startsWith("data:")) return cover;   // 已经是 data_url
+  // 磁盘路径 → base64
+  const p = join(agent.data_dir, /* project */, "covers", cover);
+  if (!existsSync(p)) return "";
+  const buffer = readFileSync(p);
+  const ext = extname(p).toLowerCase().replace(".", "");
+  const mime = ext === "jpg" ? "image/jpeg" : \`image/\${ext}\`;
+  return \`data:\${mime};base64,\${buffer.toString("base64")}\`;
+}
+\`\`\`
+
+### 禁止
+
+- ❌ 返回 \`"/api/applications/{project}/xxx/cover/xxx"\` 这种 URL
+- ❌ 期望"网关注册路由"
+- ❌ 期望"网关能读插件的 http_routes 导出"
 
 ## ★ 禁止 as any 绕类型检查（重要）
 
@@ -591,7 +754,9 @@ if (!agent.llm) {
 □ 未知 action 返回 { ok: false, error: "未知 action: xxx" }
 □ 返回 envelop.payload = { ok: true/false, data/error: ... }; return envelop
 □ 无 HTTP server / Web 框架
+□ 无自定义 HTTP 路由（禁止 http_routes 导出）
 □ 无硬编码项目名 / 路径 / URL / 数据
+□ 图片 / 文件访问用 base64 data_url（不用 URL）
 □ 无 console.log
 □ import 全在文件顶部
 □ 每个 action 分支都返回 Envelop

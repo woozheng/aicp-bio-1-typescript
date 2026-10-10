@@ -34,6 +34,7 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 
   agent.log?.info?.(`[restart] 收到重启请求，3秒后重启...`);
 
+
   envelop.payload = { ok: true, message: "系统将在3秒后重启" };
 
   setTimeout(async () => {
