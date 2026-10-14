@@ -11,7 +11,41 @@
  */
 
 export const GENERATE_BACKEND_SYSTEM = `你是 TypeScript / Bun 后端工程师。你的唯一任务：按插件 spec 生成完整可运行的 AICP 插件。
+## ★ 依赖声明规范（@DEPS）—— 最高优先级
 
+优先用 Node/Bun 自带能力（fetch、fs、path、crypto、url、http、Buffer、Bun.* 等）。
+只有明显别扭时才引第三方库（如复杂校验、日期处理、PDF 生成、Excel 读写等）。
+
+需要时在文件顶部用 // @DEPS: 声明：
+
+// @DEPS: zod
+// @DEPS: zod@3.22.0
+// @DEPS: @scope/pkg@1.2.3
+
+规则：
+1. @DEPS 必须在文件顶部、import 之前
+2. 一行一个依赖（也可以一行多个，空格分隔）
+3. 系统会自动 npm install（含传递依赖）
+4. 已声明 @DEPS 的库，可以直接 import
+5. 不要声明 Node/Bun 自带的模块（fs、path、crypto、fetch、Bun 等）
+6. 不要写不存在的包名或版本
+
+判断标准：用 Node 自带能力写这件事，是"顺手"还是"别扭"？
+- 顺手（fetch 调 API、fs 读写文件、crypto 算 hash）→ 用自带，不引库
+- 别扭（zod 式复杂校验、dayjs 式日期处理、pdfkit 生成 PDF）→ 引库
+
+不确定时：用 Node 自带能力。宁可代码多 20 行，也不要引一个不确定的库。
+
+完整示例：
+// @DEPS: zod@3.22.0
+
+import { z } from "zod";
+import type { Envelop } from "../../../core/Envelop.js";
+import type { Agent } from "../../../core/Agent.js";
+
+export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> {
+  // ...
+}
 ## ★ Import 规则（最高优先级，违反即失败）
 
 所有后端插件必须从以下路径导入 Envelop 和 Agent。
@@ -766,7 +800,10 @@ if (!agent.llm) {
 □ 流式 action 用 agent.llm.chat_stream 且 streaming 数组里有它
 □ 流式插件用 import { Envelop }（不是 type）
 □ 流式插件 channel_id 用 \`pa_\${sessionId}\`，sessionId 从 envelop.meta.session_id 取
-□ 改造任务：保留了现有所有 action / 字段名 / 函数名`;
+□ 改造任务：保留了现有所有 action / 字段名 / 函数名
+□ 用了第三方库的话，@DEPS 写在文件顶部 import 之前
+□ 没有声明 Node/Bun 自带的模块（fs、path、crypto 等）`;
+
 
 export const GENERATE_BACKEND_USER_TEMPLATE = (
   document: any,

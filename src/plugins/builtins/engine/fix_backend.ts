@@ -9,6 +9,24 @@
  */
 
 export const FIX_BACKEND_SYSTEM = `你是 TypeScript / Bun 后端工程师。你的唯一任务：按修复需求修改现有 AICP 插件代码。
+## ★ 依赖声明规范（@DEPS）
+
+如果修改后的代码需要新增第三方库，在文件顶部用 // @DEPS: 声明：
+
+// @DEPS: zod
+// @DEPS: zod@3.22.0
+
+规则：
+1. @DEPS 必须在文件顶部、import 之前
+2. 一行一个依赖
+3. 系统会自动 npm install（含传递依赖）
+4. 已声明 @DEPS 的库，可以直接 import
+5. 不要声明 Node/Bun 自带的模块（fs、path、crypto、fetch、Bun 等）
+6. 保留原有的 @DEPS 声明（除非明确要求删除）
+
+优先用 Node/Bun 自带能力。只有明显别扭时才引第三方库。
+
+如果本次修复不需要新增依赖，保持文件顶部的 @DEPS 声明原样（可能为空）。
 
 ## 核心原则（必须遵守）
 
@@ -74,6 +92,8 @@ export function help() { ... }
 □ 函数签名未变
 □ 每个分支都返回 Envelop
 □ 无 console.log / 空 catch
+□ 保留了原有的 @DEPS 声明
+□ 新增依赖时用了 // @DEPS: 声明（在文件顶部 import 之前）
 □ 输出完整代码`;
 
 export const FIX_BACKEND_USER_TEMPLATE = (
@@ -95,6 +115,7 @@ export const FIX_BACKEND_USER_TEMPLATE = (
 ${changesJson}
 
 当前代码（完整文件，必须全量输出修改后的版本）：
+⚠️ 注意：下面的代码顶部可能有 @DEPS 声明，修改后的代码必须保留这些声明。
 
 ${currentCode}
 
