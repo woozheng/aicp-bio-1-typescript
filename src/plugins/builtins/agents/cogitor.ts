@@ -1,10 +1,11 @@
 /**
- * cogitor — AICP 系统概览（分组 + 描述版）
+ * cogitor — AICP 系统概览（分组 + 描述 + 搜索版）
  * =========================================
  * 无状态、实时、按需。
  *
  * - get_map：系统概览（分类 + 数量 + 描述）
  * - list_plugins：一次返回 分类 + 插件名 + 描述
+ * - search：按词搜索（支持 terms 列表 / query 字符串）
  *
  * 分类规则：
  *   applications/xxx/yyy → 按项目分组（projects）
@@ -125,6 +126,19 @@ function extractDesc(pluginName: string): string {
 
   _descCache.set(pluginName, desc);
   return desc;
+}
+
+// ============================================================
+// 拆词：按非中英文数字的符号拆，保留 _ 和 -
+// ============================================================
+
+function tokenize(query: string): string[] {
+  if (!query) return [];
+  const tokens = query
+    .trim()
+    .split(/[^\u4e00-\u9fffa-zA-Z0-9_-]+/)
+    .filter((t) => t.length > 0);
+  return tokens.map((t) => t.toLowerCase());
 }
 
 // ============================================================
@@ -292,6 +306,100 @@ function formatGroupSummary(groups: Record<string, GroupEntry>, total: number): 
 }
 
 // ============================================================
+// 搜索
+// ============================================================
+
+interface SearchResult {
+  name: string;
+  desc: string;
+  score: number;
+  matched_terms: string[];
+  match_detail: Record<string, string[]>;
+  desc_matched: { term: string; snippet: string }[];
+}
+
+function termSearch(
+  terms: string[],
+  pluginNames: string[],
+  limit: number = 10,
+  mode: "any" | "all" = "any"
+): SearchResult[] {
+  if (!terms || terms.length === 0) return [];
+
+  // 统一小写，去空白
+  const normalizedTerms = terms
+    .map((t) => (t || "").toLowerCase().trim())
+    .filter((t) => t.length > 0);
+  if (normalizedTerms.length === 0) return [];
+
+  const results: SearchResult[] = [];
+
+  for (const name of pluginNames) {
+    const desc = extractDesc(name);
+    const nameLower = name.toLowerCase();
+    const descLower = desc.toLowerCase();
+
+    let score = 0;
+    const matchedTerms: string[] = [];
+    const matchDetail: Record<string, string[]> = {};
+    const descMatched: { term: string; snippet: string }[] = [];
+
+    for (const term of normalizedTerms) {
+      let termScore = 0;
+      const matchedIn: string[] = [];
+
+      if (nameLower.includes(term)) {
+        termScore += 10;
+        matchedIn.push("name");
+      }
+      if (descLower.includes(term)) {
+        termScore += 5;
+        matchedIn.push("desc");
+        // 提取描述里的命中片段
+        const idx = descLower.indexOf(term);
+        if (idx >= 0) {
+          const start = Math.max(0, idx - 20);
+          const end = Math.min(desc.length, idx + term.length + 20);
+          let snippet = desc.slice(start, end);
+          if (start > 0) snippet = "…" + snippet;
+          if (end < desc.length) snippet = snippet + "…";
+          descMatched.push({ term, snippet });
+        }
+      }
+
+      if (termScore > 0) {
+        score += termScore;
+        matchedTerms.push(term);
+        matchDetail[term] = matchedIn;
+      }
+    }
+
+    // 模式判断
+    if (mode === "all") {
+      if (matchedTerms.length < normalizedTerms.length) continue;
+    } else {
+      if (matchedTerms.length === 0) continue;
+    }
+
+    // 加分
+    if (desc) score += 2;
+    score += matchedTerms.length * 3;
+
+    results.push({
+      name,
+      desc,
+      score,
+      matched_terms: matchedTerms,
+      match_detail: matchDetail,
+      desc_matched: descMatched,
+    });
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  return results.slice(0, limit);
+}
+
+// ============================================================
 // 主入口
 // ============================================================
 
@@ -386,6 +494,46 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
     return envelop;
   }
 
+  // ============================================================
+  // search：按词搜索
+  // ============================================================
+  if (action === "search") {
+    // 优先 terms，其次 query
+    let terms: string[] = envelop.payload?.terms ?? [];
+    if (!Array.isArray(terms) || terms.length === 0) {
+      const query = (envelop.payload?.query ?? "").trim();
+      terms = tokenize(query);
+    }
+
+    if (terms.length === 0) {
+      envelop.payload = { ok: false, error: "缺少 terms 或 query 参数" };
+      return envelop;
+    }
+
+    const limit = envelop.payload?.limit ?? 10;
+    const mode = envelop.payload?.mode === "all" ? "all" : "any";
+
+    let pluginNames: string[];
+    try {
+      pluginNames = await fetchPluginNames(agent);
+    } catch (e) {
+      envelop.payload = { ok: false, error: `${e}` };
+      return envelop;
+    }
+
+    // 跳过 www
+    const backendNames = pluginNames.filter((n) => !n.startsWith("www/"));
+    const results = termSearch(terms, backendNames, limit, mode);
+
+    envelop.payload = {
+      ok: true,
+      terms,
+      results,
+      total: results.length,
+    };
+    return envelop;
+  }
+
   envelop.payload = { ok: false, error: `未知 action: ${action}` };
   return envelop;
 }
@@ -397,21 +545,25 @@ export async function execute(envelop: Envelop, agent: Agent): Promise<Envelop> 
 export function help() {
   return {
     route: "builtins/agents/cogitor",
-    description: "系统概览 — 分组+描述，一次查询",
+    description: "系统概览 — 分组+描述+搜索",
     input: {
-      action: "get_map | list_plugins",
+      action: "get_map | list_plugins | search",
       category: "（list_plugins 可选）分类名，如 builtins、os、applications",
+      terms: '（search 可选）词列表，如 ["股票", "stock"]',
+      query: "（search 可选）查询字符串，会按空格/标点拆词",
+      limit: "（search 可选）返回数量，默认 10",
+      mode: "（search 可选）any 任一命中 | all 全部命中，默认 any",
     },
     output: {
       ok: "是否成功",
       summary: "系统概览文本（get_map）",
       groups: "分组+插件名+描述（list_plugins 无参数）",
       plugins: "完整插件列表（list_plugins 指定 category）",
+      results: "搜索结果（search）",
     },
     examples: [
-      'list_plugins → {"groups": {"builtins": {"plugins": [{"name": "builtins/tools/aicp_chat", "desc": "..."}]}}}',
-      'list_plugins category=builtins → {"plugins": [{"name": "builtins/tools/aicp_chat", "desc": "..."}]}',
-      'list_plugins category=applications → {"projects": {"task_board": {"count": 3, "desc": "..."}}}',
+      'search terms=["股票","stock"] → {"results": [{"name": "...", "desc": "...", "match_detail": {...}}]}',
+      'search query="股票 stock" → 同上（query 会被拆成 ["股票","stock"]）',
     ],
   };
 }
